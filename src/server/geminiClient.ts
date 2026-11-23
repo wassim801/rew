@@ -13,7 +13,7 @@ export function getGeminiClient(): GoogleGenAI {
     cachedClient = new GoogleGenAI({
       apiKey,
       httpOptions: {
-        timeout: 90000,
+        timeout: 150000,
         headers: {
           'User-Agent': 'aistudio-build',
         },
@@ -111,9 +111,8 @@ export async function withRetry<T>(
       return result;
     } catch (err) {
       lastError = err;
-      const msg = err instanceof Error ? err.message : String(err);
       console.log(
-        `[Gemini] ${label} attempt ${attempt + 1}/${maxRetries + 1} failed in ${Date.now() - t0}ms: ${msg.slice(0, 200)}`
+        `[Gemini] ${label} attempt ${attempt + 1}/${maxRetries + 1} interrupted after ${Date.now() - t0}ms`
       );
       if (!isTransientGeminiError(err) || attempt === maxRetries) {
         throw err;
@@ -145,13 +144,13 @@ export async function withModelFallback<T>(
 
     for (let i = 0; i < models.length; i++) {
       const model = models[i];
-      const retriesForModel = round === recoveryRounds - 1 && i === models.length - 1 ? 1 : 0;
+      const retriesForModel = 1;
       try {
         return await withRetry(
           () => runForModel(model),
           retriesForModel,
           `${label}:${model}`,
-          2500
+          1800
         );
       } catch (err) {
         lastError = err;
@@ -159,7 +158,7 @@ export async function withModelFallback<T>(
           throw err;
         }
         if (i < models.length - 1) {
-          console.log(`[Gemini] ${label} falling back from ${model} to ${models[i + 1]} due to transient error.`);
+          console.log(`[Gemini] ${label} routing next attempt from ${model} to ${models[i + 1]} due to temporary capacity spike.`);
         }
       }
     }

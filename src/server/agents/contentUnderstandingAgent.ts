@@ -92,7 +92,7 @@ ${formattedTranscript || '(No spoken dialogue detected — classify from visual 
         model,
         contents: { parts },
         config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH },
           responseMimeType: 'application/json',
           responseSchema: {
           type: Type.OBJECT,

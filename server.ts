@@ -649,6 +649,7 @@ async function startServer() {
         transcript: project.transcript,
         analysis: project.analysis,
         settings,
+        sourcePath: project.hasLocalVideoFile ? project.sourcePath : undefined,
       });
 
       store.replaceProjectHighlights(project.id, highlights);
@@ -678,6 +679,9 @@ async function startServer() {
     }
     if (typeof body.title === 'string' && body.title.trim()) {
       patch.title = body.title.trim();
+    }
+    if (typeof body.hookHeadline === 'string') {
+      patch.hookHeadline = body.hookHeadline.trim();
     }
     if (typeof body.description === 'string') {
       patch.description = body.description.trim();
@@ -711,6 +715,7 @@ async function startServer() {
     const affectsRender =
       (patch.startTime !== undefined && patch.startTime !== existing.startTime) ||
       (patch.endTime !== undefined && patch.endTime !== existing.endTime) ||
+      (patch.hookHeadline !== undefined && patch.hookHeadline !== (existing.hookHeadline ?? '')) ||
       (patch.editingProfile !== undefined && patch.editingProfile !== existing.editingProfile) ||
       (patch.subtitleStyle !== undefined && patch.subtitleStyle !== existing.subtitleStyle) ||
       (patch.highlightColor !== undefined && patch.highlightColor !== existing.highlightColor) ||
@@ -806,6 +811,56 @@ async function startServer() {
     }
   };
 
+  // Voice-aligned 2-4 word subtitle cues for exact live preview & rendering sync
+  app.get('/api/highlights/:id/aligned-subtitles', async (req, res) => {
+    try {
+      const hl = store.getHighlightInternal(req.params.id);
+      if (!hl) {
+        res.status(404).json({ error: 'Highlight not found' });
+        return;
+      }
+      const project = store.getProjectInternal(hl.projectId);
+      if (!project) {
+        res.status(404).json({ error: 'Parent project not found' });
+        return;
+      }
+
+      if (!project.hasLocalVideoFile || !fs.existsSync(project.sourcePath) || project.metadata?.hasAudio === false) {
+        const clipDur = Math.max(1, hl.endTime - hl.startTime);
+        const cues = project.transcript
+          .filter((s) => s.end > hl.startTime && s.start < hl.endTime)
+          .map((s) => ({
+            start: Number(Math.max(0, s.start - hl.startTime).toFixed(2)),
+            end: Number(Math.min(clipDur, s.end - hl.startTime).toFixed(2)),
+            speaker: s.speaker,
+            text: s.text,
+          }));
+        res.json({ cues });
+        return;
+      }
+
+      const startQ = Number(req.query.start);
+      const endQ = Number(req.query.end);
+      const startTime = Number.isFinite(startQ) && startQ >= 0 ? startQ : hl.startTime;
+      const endTime = Number.isFinite(endQ) && endQ > startTime ? endQ : hl.endTime;
+
+      const { alignClipSubtitlesWithAudio } = await import('./src/server/agents/transcriptionAgent');
+      const cues = await alignClipSubtitlesWithAudio({
+        projectId: project.id,
+        sourcePath: project.sourcePath,
+        highlightId: hl.id,
+        startTime,
+        endTime,
+        fallbackTranscript: project.transcript,
+        languageHint: project.analysis?.languageCode || 'en',
+      });
+      res.json({ cues });
+    } catch (err) {
+      const msg = formatGeminiError(err) || 'Failed to align clip subtitles';
+      res.status(500).json({ error: msg });
+    }
+  });
+
   // Render vertical 9:16 1080x1920 clip with FFmpeg & run Quality Control Agent
   app.post('/api/highlights/:id/render', async (req, res) => {
     try {
@@ -813,7 +868,7 @@ async function startServer() {
       res.json({ highlight: result.highlight, qcReport: result.qcReport });
     } catch (err) {
       const status = (err as { statusCode?: number })?.statusCode || 500;
-      const msg = err instanceof Error ? err.message : 'FFmpeg clip rendering failed';
+      const msg = formatGeminiError(err) || (err instanceof Error ? err.message : 'FFmpeg clip rendering failed');
       res.status(status).json({ error: msg });
     }
   });

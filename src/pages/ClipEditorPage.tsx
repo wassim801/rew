@@ -68,6 +68,7 @@ export function ClipEditorPage({
   }, [projectHighlights, selectedHighlightId]);
 
   const [title, setTitle] = useState('');
+  const [hookHeadline, setHookHeadline] = useState('');
   const [description, setDescription] = useState('');
   const [startTime, setStartTime] = useState(0);
   const [endTime, setEndTime] = useState(15);
@@ -91,6 +92,10 @@ export function ClipEditorPage({
   const [isPlaying, setIsPlaying] = useState(false);
   const [videoBuffering, setVideoBuffering] = useState(false);
   const [videoError, setVideoError] = useState<string | null>(null);
+  const [alignedCues, setAlignedCues] = useState<
+    Array<{ start: number; end: number; speaker: string; text: string }>
+  >([]);
+  const [aligningCues, setAligningCues] = useState(false);
 
   const sourceVideoRef = useRef<HTMLVideoElement | null>(null);
   const renderedVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -99,6 +104,7 @@ export function ClipEditorPage({
   useEffect(() => {
     if (!activeHighlight) return;
     setTitle(activeHighlight.title);
+    setHookHeadline(activeHighlight.hookHeadline ?? '');
     setDescription(activeHighlight.description);
     setStartTime(activeHighlight.startTime);
     setEndTime(activeHighlight.endTime);
@@ -115,6 +121,40 @@ export function ClipEditorPage({
     setVideoError(null);
   }, [activeHighlight?.id, activeHighlight?.renderedVideoUrl]);
 
+  // Fetch voice-aligned subtitle cues for exact Live Source Preview sync
+  useEffect(() => {
+    if (!activeHighlight || !project || project.hasLocalVideoFile === false) {
+      setAlignedCues([]);
+      return;
+    }
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      setAligningCues(true);
+      try {
+        const res = await fetch(
+          `/api/highlights/${encodeURIComponent(
+            activeHighlight.id
+          )}/aligned-subtitles?start=${startTime.toFixed(2)}&end=${endTime.toFixed(2)}`
+        );
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          cues?: Array<{ start: number; end: number; speaker: string; text: string }>;
+        };
+        if (!cancelled && Array.isArray(data.cues)) {
+          setAlignedCues(data.cues);
+        }
+      } catch {
+        // Fallback smoothly to project.transcript chunks
+      } finally {
+        if (!cancelled) setAligningCues(false);
+      }
+    }, 350);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [activeHighlight?.id, project?.id, project?.hasLocalVideoFile, startTime, endTime]);
+
   // Keep source preview synced to startTime once video metadata is ready
   useEffect(() => {
     const el = sourceVideoRef.current;
@@ -125,6 +165,59 @@ export function ClipEditorPage({
       setCurrentPlayTime(startTime);
     }
   }, [previewMode, startTime, activeHighlight?.id]);
+
+  // Build rhythmic 2-4 word display phrases from voice-aligned cues (or weighted project transcript fallback)
+  const previewSubtitlePhrases = useMemo(() => {
+    const clipDur = Math.max(1, endTime - startTime);
+    const sourceCues =
+      alignedCues.length > 0
+        ? alignedCues
+        : (project?.transcript ?? [])
+            .filter((s) => s.end > startTime && s.start < endTime)
+            .map((s) => ({
+              start: Math.max(0, s.start - startTime),
+              end: Math.min(clipDur, s.end - startTime),
+              speaker: s.speaker,
+              text: s.text,
+            }));
+
+    const out: Array<{ start: number; end: number; text: string }> = [];
+    for (const cue of sourceCues) {
+      const cStart = Math.max(0, cue.start);
+      const cEnd = Math.min(clipDur, cue.end);
+      if (cEnd - cStart < 0.15) continue;
+      const words = cue.text.trim().split(/\s+/).filter(Boolean);
+      if (!words.length) continue;
+
+      const groups: string[][] = [];
+      let cur: string[] = [];
+      for (const w of words) {
+        const len = [...cur, w].join(' ').length;
+        if (cur.length >= 4 || (cur.length >= 2 && len > 22)) {
+          groups.push(cur);
+          cur = [w];
+        } else {
+          cur.push(w);
+        }
+      }
+      if (cur.length) groups.push(cur);
+
+      const totalW = groups.reduce((acc, g) => acc + Math.max(2, g.join('').length), 0) || 1;
+      const dur = Math.max(0.25, cEnd - cStart);
+      let cursor = cStart;
+      for (let i = 0; i < groups.length; i++) {
+        const w = Math.max(2, groups[i].join('').length);
+        const fDur = i === groups.length - 1 ? cEnd - cursor : (dur * w) / totalW;
+        out.push({
+          start: cursor,
+          end: Math.min(clipDur, Math.max(cursor + 0.2, cursor + fDur)),
+          text: groups[i].join(' '),
+        });
+        cursor += fDur;
+      }
+    }
+    return out;
+  }, [alignedCues, project?.transcript, startTime, endTime]);
 
   if (!project || !activeHighlight) {
     return (
@@ -146,16 +239,16 @@ export function ClipEditorPage({
   }
 
   const maxSourceDuration = project.metadata?.duration ?? Math.max(endTime, 60);
+  const clipDuration = Math.max(1, endTime - startTime);
+  const relativePlayTime =
+    previewMode === 'rendered' && activeHighlight.renderedVideoUrl
+      ? currentPlayTime
+      : Math.max(0, currentPlayTime - startTime);
 
-  const activeTranscriptLine = useMemo(() => {
-    if (!project.transcript.length) return null;
-    const t = previewMode === 'rendered' ? startTime + currentPlayTime : currentPlayTime;
-    return (
-      project.transcript.find((seg) => t >= seg.start && t <= seg.end) ??
-      project.transcript.find((seg) => seg.end >= startTime && seg.start <= endTime) ??
-      null
-    );
-  }, [project.transcript, currentPlayTime, previewMode, startTime, endTime]);
+  const activeSubtitleCue =
+    previewSubtitlePhrases.find((c) => relativePlayTime >= c.start && relativePlayTime <= c.end) ??
+    previewSubtitlePhrases[0] ??
+    null;
 
   const handleProfileChange = (nextId: EditingProfileId) => {
     setEditingProfile(nextId);
@@ -174,6 +267,7 @@ export function ClipEditorPage({
     try {
       await onSaveHighlight(activeHighlight.id, {
         title,
+        hookHeadline: hookHeadline.trim() || undefined,
         description,
         startTime,
         endTime,
@@ -275,7 +369,7 @@ export function ClipEditorPage({
       : 'object-center';
 
   const qc = activeHighlight.qcReport;
-  const rtl = isArabicText(activeTranscriptLine?.text || title);
+  const rtl = isArabicText(activeSubtitleCue?.text || hookHeadline || title);
 
   return (
     <div className="mx-auto max-w-6xl space-y-6 p-6 lg:p-8">
@@ -441,37 +535,87 @@ export function ClipEditorPage({
                       : `object-cover ${objectPositionClass}`
                   }`}
                 />
-                {/* Interactive Live Caption Overlay on Source Preview */}
-                {activeTranscriptLine && (
+                {/* Opening Hook Card Preview (0.0s - 3.2s) */}
+                {subtitleStyle !== 'minimal-caption' &&
+                  relativePlayTime <= 3.2 &&
+                  (hookHeadline || title).trim() && (
+                    <div className="pointer-events-none absolute inset-x-4 top-6 text-center space-y-1.5">
+                      <div>
+                        <span
+                          className="inline-block rounded px-2 py-0.5 text-[9px] font-extrabold uppercase tracking-widest text-[#090e1a] shadow"
+                          style={{ backgroundColor: highlightColor }}
+                        >
+                          {activeHighlight.categoryName}
+                        </span>
+                      </div>
+                      <div
+                        dir={rtl ? 'rtl' : 'ltr'}
+                        className="inline-block rounded-lg bg-slate-950/85 px-3 py-1.5 text-xs font-bold leading-snug text-white shadow-lg border border-white/10"
+                      >
+                        {(hookHeadline || title).trim().split(/\s+/).slice(0, 7).join(' ')}
+                      </div>
+                    </div>
+                  )}
+
+                {/* Voice-Synced Live Caption Overlay with Active Word Pop */}
+                {activeSubtitleCue && (
                   <div className="pointer-events-none absolute inset-x-4 bottom-16 text-center">
                     <span
                       dir={rtl ? 'rtl' : 'ltr'}
-                      className={`inline-block rounded px-2.5 py-1 text-sm leading-snug text-white bg-black/65 ${
+                      className={`inline-block rounded-lg px-3 py-1.5 text-sm leading-snug text-white shadow-lg ${
+                        subtitleStyle === 'clean' || subtitleStyle === 'minimal-caption'
+                          ? 'bg-slate-950/80 border border-white/10'
+                          : 'bg-black/55 drop-shadow-[0_2px_4px_rgba(0,0,0,0.95)]'
+                      } ${
                         subtitleStyle === 'bold-highlight' || subtitleStyle === 'karaoke-pop'
-                          ? 'font-bold'
-                          : 'font-medium'
+                          ? 'font-extrabold tracking-tight'
+                          : 'font-semibold'
                       }`}
                     >
-                      {activeTranscriptLine.text.split(/\s+/).slice(0, 8).map((word, idx) => {
-                        const isKw = activeHighlight.keywords.some((k) =>
-                          word.toLowerCase().includes(k.toLowerCase())
+                      {(() => {
+                        const words = activeSubtitleCue.text.split(/\s+/).filter(Boolean);
+                        const cueDur = Math.max(0.25, activeSubtitleCue.end - activeSubtitleCue.start);
+                        const frac = Math.max(
+                          0,
+                          Math.min(1, (relativePlayTime - activeSubtitleCue.start) / cueDur)
                         );
-                        return (
-                          <span
-                            key={idx}
-                            style={
-                              isKw && subtitleStyle !== 'minimal-caption'
-                                ? { color: highlightColor }
-                                : undefined
-                            }
-                          >
-                            {word}{' '}
-                          </span>
+                        const activeWordIdx = Math.min(
+                          words.length - 1,
+                          Math.floor(frac * words.length)
                         );
-                      })}
+                        return words.map((word, idx) => {
+                          const isKw = activeHighlight.keywords.some((k) =>
+                            word.toLowerCase().includes(k.toLowerCase())
+                          );
+                          const isSpoken =
+                            !rtl &&
+                            (subtitleStyle === 'karaoke-pop' || subtitleStyle === 'bold-highlight') &&
+                            idx <= activeWordIdx;
+                          const colorStyle =
+                            subtitleStyle !== 'minimal-caption' && (isSpoken || isKw)
+                              ? { color: highlightColor }
+                              : undefined;
+                          return (
+                            <span key={idx} style={colorStyle}>
+                              {word}{' '}
+                            </span>
+                          );
+                        });
+                      })()}
                     </span>
                   </div>
                 )}
+
+                {/* Sleek Live Bottom Progress Bar */}
+                <div className="pointer-events-none absolute inset-x-0 bottom-0 h-1 bg-black/45">
+                  <div
+                    className="h-full transition-[width] duration-75"
+                    style={{
+                      width: `${Math.max(2, Math.min(100, (relativePlayTime / clipDuration) * 100))}%`,
+                      backgroundColor: highlightColor,
+                    }}
+                  />
+                </div>
               </>
             )}
 
@@ -550,10 +694,12 @@ export function ClipEditorPage({
 
           <p className="text-center text-xs text-slate-400 max-w-xs">
             {previewMode === 'rendered' && activeHighlight.renderedVideoUrl
-              ? 'Playing actual FFmpeg-rendered 1080×1920 H.264/AAC clip with burned-in subtitles.'
+              ? 'Playing actual FFmpeg-rendered 1080×1920 montage with voice-synced karaoke subtitles, hook card, and EBU R128 audio.'
               : project.hasLocalVideoFile === false && project.youtubeVideoId
               ? 'Previewing YouTube segment directly. Attach local MP4 or download with cookies below to unlock FFmpeg 9:16 rendering.'
-              : 'Previewing source range. Click "Render 9:16 MP4" to burn subtitles, apply crop, and normalize audio.'}
+              : aligningCues
+              ? 'Synchronizing live captions with the voice track...'
+              : 'Previewing live montage & voice-synced captions. Click "Render 9:16 MP4" to export dynamic cuts, color grade, and broadcast audio.'}
           </p>
 
           {project.hasLocalVideoFile === false && (
@@ -634,6 +780,18 @@ export function ClipEditorPage({
                   value={title}
                   onChange={(e) => setTitle(e.target.value)}
                   className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:border-blue-500 focus:outline-none"
+                />
+              </label>
+
+              <label className="block text-xs font-medium text-slate-300 sm:col-span-2">
+                On-Screen Hook Banner (first 3s)
+                <input
+                  type="text"
+                  dir={rtl ? 'rtl' : 'ltr'}
+                  value={hookHeadline}
+                  onChange={(e) => setHookHeadline(e.target.value)}
+                  placeholder={title.split(/\s+/).slice(0, 5).join(' ') || 'Punchy 3–5 word opening hook...'}
+                  className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-blue-500 focus:outline-none"
                 />
               </label>
 
