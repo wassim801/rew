@@ -1,5 +1,7 @@
+import fs from 'fs';
 import type { VideoMetadata } from '../../types/studio';
 import { store } from '../db';
+import { formatGeminiError } from '../geminiClient';
 import { analyzeVideoContent } from './contentUnderstandingAgent';
 import { generateAndScoreHighlights } from './highlightAgent';
 import { transcribeProjectAudio } from './transcriptionAgent';
@@ -155,7 +157,7 @@ export async function runYouTubePipeline(params: {
       null
     );
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'YouTube import failed.';
+    const message = formatGeminiError(err) || 'YouTube import failed.';
     store.updateProjectStage(projectId, 'failed', 0, message, 'error', message);
   }
 }
@@ -168,69 +170,110 @@ export async function runProjectPipeline(projectId: string): Promise<void> {
 
   try {
     // Stage 1: Video Ingestion (FFprobe + Audio extraction + Scene keyframes)
-    store.updateProjectStage(
-      projectId,
-      'ingesting',
-      15,
-      'Validating video streams with FFprobe and extracting audio & scene keyframes...'
-    );
+    const hasCachedIngestion =
+      Boolean(project.metadata) &&
+      (!project.metadata?.hasAudio || (Boolean(project.audioPath) && fs.existsSync(project.audioPath!))) &&
+      project.scenes.length > 0;
 
-    const metadata = await probeVideoMetadata(project.sourcePath);
-    const audioPath = metadata.hasAudio
-      ? await extractAudioTrack(project.sourcePath, projectId)
-      : null;
-    const scenes = await extractSceneKeyframes(project.sourcePath, projectId, metadata.duration);
+    let metadata: VideoMetadata;
+    let audioPath: string | null;
+    let scenes = project.scenes;
 
-    store.saveIngestionData(projectId, metadata, audioPath, scenes);
+    if (hasCachedIngestion && project.metadata) {
+      metadata = project.metadata;
+      audioPath = project.audioPath;
+      store.updateProjectStage(
+        projectId,
+        'ingesting',
+        35,
+        'Resuming from saved video metadata, audio track, and scene keyframes...'
+      );
+    } else {
+      store.updateProjectStage(
+        projectId,
+        'ingesting',
+        15,
+        'Validating video streams with FFprobe and extracting audio & scene keyframes...'
+      );
 
-    // Stage 2: Transcription Agent
-    store.updateProjectStage(
-      projectId,
-      'transcribing',
-      40,
-      'Generating timestamped transcript with sentence boundaries and speaker labels...'
-    );
+      metadata = await probeVideoMetadata(project.sourcePath);
+      audioPath = metadata.hasAudio
+        ? await extractAudioTrack(project.sourcePath, projectId)
+        : null;
+      scenes = await extractSceneKeyframes(project.sourcePath, projectId, metadata.duration);
 
-    const { segments } = audioPath
-      ? await transcribeProjectAudio({
-          projectId,
-          audioPath,
-          duration: metadata.duration,
-          languageHint: settings.defaultLanguageHint,
-          onChunkProgress: (completed, total) => {
-            if (total > 1) {
-              const pct = Math.min(64, Math.round(40 + (completed / total) * 24));
-              store.updateProjectStage(
-                projectId,
-                'transcribing',
-                pct,
-                `Transcribed audio segment ${completed} of ${total}...`
-              );
-            }
-          },
-        })
-      : { segments: [] };
+      store.saveIngestionData(projectId, metadata, audioPath, scenes);
+    }
 
-    store.saveTranscript(projectId, segments);
+    // Stage 2: Transcription Agent (reuses full transcript if saved, or resumes per-10m chunks on retry)
+    let segments = project.transcript;
+    if (segments.length > 0) {
+      store.updateProjectStage(
+        projectId,
+        'transcribing',
+        64,
+        `Resuming with saved transcript (${segments.length} segments)...`
+      );
+    } else {
+      store.updateProjectStage(
+        projectId,
+        'transcribing',
+        40,
+        'Generating timestamped transcript with sentence boundaries and speaker labels...'
+      );
+
+      const transcribed = audioPath
+        ? await transcribeProjectAudio({
+            projectId,
+            audioPath,
+            duration: metadata.duration,
+            languageHint: settings.defaultLanguageHint,
+            onChunkProgress: (completed, total) => {
+              if (total > 1) {
+                const pct = Math.min(64, Math.round(40 + (completed / total) * 24));
+                store.updateProjectStage(
+                  projectId,
+                  'transcribing',
+                  pct,
+                  `Transcribed audio segment ${completed} of ${total}...`
+                );
+              }
+            },
+          })
+        : { segments: [] };
+
+      segments = transcribed.segments;
+      store.saveTranscript(projectId, segments);
+    }
 
     // Stage 3: Content Understanding & Category Classification Agent
-    store.updateProjectStage(
-      projectId,
-      'analyzing',
-      68,
-      'Analyzing topics, speaker context, scenes, and multi-label content categories...'
-    );
+    let analysis = project.analysis;
+    if (analysis) {
+      store.updateProjectStage(
+        projectId,
+        'analyzing',
+        84,
+        `Resuming with saved ${analysis.primaryCategoryName} content analysis...`
+      );
+    } else {
+      store.updateProjectStage(
+        projectId,
+        'analyzing',
+        68,
+        'Analyzing topics, speaker context, scenes, and multi-label content categories...'
+      );
 
-    const analysis = await analyzeVideoContent({
-      projectId,
-      title: project.title,
-      metadata,
-      transcript: segments,
-      scenes,
-      customCategories: settings.customCategories,
-    });
+      analysis = await analyzeVideoContent({
+        projectId,
+        title: project.title,
+        metadata,
+        transcript: segments,
+        scenes,
+        customCategories: settings.customCategories,
+      });
 
-    store.saveAnalysis(projectId, analysis);
+      store.saveAnalysis(projectId, analysis);
+    }
 
     // Stage 4: Category-Specific Highlight Agent & Scoring Engine
     store.updateProjectStage(
@@ -260,7 +303,7 @@ export async function runProjectPipeline(projectId: string): Promise<void> {
       null
     );
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Pipeline execution failed.';
+    const message = formatGeminiError(err) || 'Pipeline execution failed.';
     store.updateProjectStage(projectId, 'failed', 0, message, 'error', message);
   }
 }

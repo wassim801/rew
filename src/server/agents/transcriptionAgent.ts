@@ -203,6 +203,9 @@ export async function transcribeProjectAudio(params: {
   let languageCode = 'en';
   const mergedRaw: Array<{ start: number; end: number; speaker: string; text: string }> = [];
 
+  const projectDir = resolveSafePath(PROJECTS_DIR, projectId);
+  const chunkCacheDir = resolveSafePath(projectDir, 'transcript_chunks');
+
   if (fileSizeMb <= 12 && duration <= 720) {
     const audioBytes = fs.readFileSync(audioPath);
     const res = await transcribeSingleAudioChunk({
@@ -215,45 +218,88 @@ export async function transcribeProjectAudio(params: {
     mergedRaw.push(...res.segments);
     onChunkProgress?.(1, 1);
   } else {
-    // Split long-form audio into 10-minute segments so multi-hour (3h+) videos transcribe fast & accurately
+    // Split long-form audio into 10-minute segments with persistent per-chunk checkpoints
     const chunkSeconds = 600;
     const totalChunks = Math.max(1, Math.ceil(duration / chunkSeconds));
-    const projectDir = resolveSafePath(PROJECTS_DIR, projectId);
     const tmpChunkDir = path.join(projectDir, `audio_chunks_${Date.now()}`);
     fs.mkdirSync(tmpChunkDir, { recursive: true });
+    fs.mkdirSync(chunkCacheDir, { recursive: true });
 
     try {
       for (let i = 0; i < totalChunks; i++) {
         const offsetSec = i * chunkSeconds;
         const segDur = Math.max(1, Math.min(chunkSeconds, duration - offsetSec));
-        const chunkPath = path.join(tmpChunkDir, `chunk_${i}.mp3`);
+        const chunkCachePath = resolveSafePath(chunkCacheDir, `chunk_${i}.json`);
 
-        await execFileAsync(
-          'ffmpeg',
-          [
-            '-y',
-            '-nostats',
-            '-loglevel',
-            'error',
-            '-ss',
-            String(offsetSec),
-            '-t',
-            String(segDur),
-            '-i',
-            audioPath,
-            '-c',
-            'copy',
-            chunkPath,
-          ],
-          { maxBuffer: 10 * 1024 * 1024 }
-        );
+        let chunkRes: {
+          detectedLanguage: string;
+          languageCode: string;
+          segments: Array<{ start: number; end: number; speaker: string; text: string }>;
+        } | null = null;
 
-        if (!fs.existsSync(chunkPath) || fs.statSync(chunkPath).size === 0) continue;
-        const chunkRes = await transcribeSingleAudioChunk({
-          audioBytes: fs.readFileSync(chunkPath),
-          chunkDuration: segDur,
-          languageHint,
-        });
+        if (fs.existsSync(chunkCachePath)) {
+          try {
+            const cached = JSON.parse(fs.readFileSync(chunkCachePath, 'utf-8')) as {
+              detectedLanguage?: string;
+              languageCode?: string;
+              segments?: Array<{ start: number; end: number; speaker: string; text: string }>;
+            };
+            if (Array.isArray(cached.segments)) {
+              chunkRes = {
+                detectedLanguage: cached.detectedLanguage || 'English',
+                languageCode: cached.languageCode || 'en',
+                segments: cached.segments,
+              };
+              console.log(
+                `[TranscriptionAgent] Reusing cached transcript chunk ${i + 1}/${totalChunks} for project ${projectId}`
+              );
+            }
+          } catch {
+            // Corrupted cache entry — re-transcribe this chunk cleanly
+          }
+        }
+
+        if (!chunkRes) {
+          const chunkPath = path.join(tmpChunkDir, `chunk_${i}.mp3`);
+          await execFileAsync(
+            'ffmpeg',
+            [
+              '-y',
+              '-nostats',
+              '-loglevel',
+              'error',
+              '-ss',
+              String(offsetSec),
+              '-t',
+              String(segDur),
+              '-i',
+              audioPath,
+              '-c',
+              'copy',
+              chunkPath,
+            ],
+            { maxBuffer: 10 * 1024 * 1024 }
+          );
+
+          if (!fs.existsSync(chunkPath) || fs.statSync(chunkPath).size === 0) {
+            onChunkProgress?.(i + 1, totalChunks);
+            continue;
+          }
+
+          chunkRes = await transcribeSingleAudioChunk({
+            audioBytes: fs.readFileSync(chunkPath),
+            chunkDuration: segDur,
+            languageHint,
+          });
+
+          fs.writeFileSync(chunkCachePath, JSON.stringify(chunkRes), 'utf-8');
+          try {
+            fs.unlinkSync(chunkPath);
+          } catch {
+            // Best-effort cleanup of processed chunk MP3
+          }
+        }
+
         if (i === 0) {
           detectedLanguage = chunkRes.detectedLanguage;
           languageCode = chunkRes.languageCode;
@@ -289,7 +335,6 @@ export async function transcribeProjectAudio(params: {
     });
 
   // Save transcript locally as JSON artifact per project
-  const projectDir = resolveSafePath(PROJECTS_DIR, projectId);
   fs.mkdirSync(projectDir, { recursive: true });
   fs.writeFileSync(
     resolveSafePath(projectDir, 'transcript.json'),
@@ -304,6 +349,11 @@ export async function transcribeProjectAudio(params: {
     ),
     'utf-8'
   );
+
+  // Clean up chunk checkpoints now that full transcript.json is saved
+  if (fs.existsSync(chunkCacheDir)) {
+    fs.rmSync(chunkCacheDir, { recursive: true, force: true });
+  }
 
   return {
     segments: normalized,

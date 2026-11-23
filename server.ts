@@ -35,6 +35,7 @@ import {
   resolveSafePath,
   store,
 } from './src/server/db';
+import { formatGeminiError } from './src/server/geminiClient';
 import type { EditingProfileId, HighlightRecord, StudioSettings } from './src/types/studio';
 
 const PORT = 3000;
@@ -653,7 +654,7 @@ async function startServer() {
       store.replaceProjectHighlights(project.id, highlights);
       res.json({ highlights });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Highlight re-analysis failed';
+      const msg = formatGeminiError(err) || 'Highlight re-analysis failed';
       res.status(500).json({ error: msg });
     }
   });
@@ -927,7 +928,7 @@ async function startServer() {
       res.json({ exportRecord: savedExport, highlight: updatedHighlight });
     } catch (err) {
       const status = (err as { statusCode?: number })?.statusCode || 500;
-      const msg = err instanceof Error ? err.message : 'Export failed';
+      const msg = formatGeminiError(err) || 'Export failed';
       res.status(status).json({ error: msg });
     }
   });
@@ -985,7 +986,7 @@ async function startServer() {
       res.json({ exports: createdExports });
     } catch (err) {
       const status = (err as { statusCode?: number })?.statusCode || 500;
-      const msg = err instanceof Error ? err.message : 'Batch export failed';
+      const msg = formatGeminiError(err) || 'Batch export failed';
       res.status(status).json({ error: msg });
     }
   });
