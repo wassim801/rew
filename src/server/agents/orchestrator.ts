@@ -290,6 +290,7 @@ export async function runProjectPipeline(projectId: string): Promise<void> {
       transcript: segments,
       analysis,
       settings,
+      sourcePath: project.sourcePath,
     });
 
     store.replaceProjectHighlights(projectId, highlights);

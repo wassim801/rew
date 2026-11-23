@@ -141,6 +141,13 @@ if (!projectCols.includes('has_local_video')) {
   db.exec(`ALTER TABLE projects ADD COLUMN has_local_video INTEGER NOT NULL DEFAULT 1`);
 }
 
+const highlightCols = (
+  db.prepare(`PRAGMA table_info(highlights)`).all() as Array<{ name: string }>
+).map((c) => c.name);
+if (!highlightCols.includes('hook_headline')) {
+  db.exec(`ALTER TABLE highlights ADD COLUMN hook_headline TEXT`);
+}
+
 export interface ProjectRowInternal extends ProjectRecord {
   sourcePath: string;
   audioPath: string | null;
@@ -182,6 +189,7 @@ function mapHighlightRow(row: Record<string, unknown>): HighlightRowInternal {
     endTime: Number(row.end_time),
     duration: Number(row.duration),
     title: String(row.title),
+    hookHeadline: row.hook_headline ? String(row.hook_headline) : undefined,
     description: String(row.description),
     categoryId: String(row.category_id),
     categoryName: String(row.category_name),
@@ -369,13 +377,13 @@ export const store = {
     const del = db.prepare(`DELETE FROM highlights WHERE project_id = ?`);
     const ins = db.prepare(
       `INSERT INTO highlights (
-        id, project_id, start_time, end_time, duration, title, description,
+        id, project_id, start_time, end_time, duration, title, hook_headline, description,
         category_id, category_name, secondary_category_name, selection_explanation,
         keywords_json, criteria_breakdown_json, status, editing_profile,
         subtitle_style, highlight_color, crop_mode, dynamic_zoom, normalize_audio,
         watermark_enabled, rendered_video_path, rendered_video_url, qc_report_json,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const now = new Date().toISOString();
     const tx = db.transaction(() => {
@@ -388,6 +396,7 @@ export const store = {
           h.endTime,
           h.duration,
           h.title,
+          h.hookHeadline ?? null,
           h.description,
           h.categoryId,
           h.categoryName,
@@ -443,6 +452,7 @@ export const store = {
       endTime: number;
       duration: number;
       title: string;
+      hookHeadline: string;
       description: string;
       status: HighlightRecord['status'];
       editingProfile: HighlightRecord['editingProfile'];
@@ -466,7 +476,7 @@ export const store = {
 
     db.prepare(
       `UPDATE highlights SET
-        start_time = ?, end_time = ?, duration = ?, title = ?, description = ?,
+        start_time = ?, end_time = ?, duration = ?, title = ?, hook_headline = ?, description = ?,
         status = ?, editing_profile = ?, subtitle_style = ?, highlight_color = ?,
         crop_mode = ?, dynamic_zoom = ?, normalize_audio = ?, watermark_enabled = ?,
         rendered_video_path = ?, rendered_video_url = ?, qc_report_json = ?, updated_at = ?
@@ -476,6 +486,7 @@ export const store = {
       endTime,
       duration,
       patch.title ?? existing.title,
+      patch.hookHeadline !== undefined ? patch.hookHeadline : existing.hookHeadline ?? null,
       patch.description ?? existing.description,
       patch.status ?? existing.status,
       patch.editingProfile ?? existing.editingProfile,

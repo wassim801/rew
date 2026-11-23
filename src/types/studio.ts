@@ -140,6 +140,7 @@ export interface HighlightRecord {
   endTime: number;
   duration: number;
   title: string;
+  hookHeadline?: string;
   description: string;
   categoryId: string;
   categoryName: string;

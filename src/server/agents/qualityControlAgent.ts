@@ -94,7 +94,7 @@ export async function validateRenderedClip(params: {
   checks.push({
     name: 'Subtitle Readability',
     status: 'pass',
-    detail: `Chunked to max 5 words/line at ${settings.subtitleFontSize}px (${maxWords} words max segment).`,
+    detail: `Audio-aligned 2–4 word rhythmic cues at ${settings.subtitleFontSize}px (${maxWords} words max source segment).`,
   });
 
   // 6. Category-appropriate editing
