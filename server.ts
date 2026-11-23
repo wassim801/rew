@@ -38,7 +38,7 @@ import {
 import { formatGeminiError } from './src/server/geminiClient';
 import type { EditingProfileId, HighlightRecord, StudioSettings } from './src/types/studio';
 
-const PORT = 3000;
+const PORT = 3001;
 
 const uploadStorage = multer.diskStorage({
   destination: (_req, _file, cb) => {
