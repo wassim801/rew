@@ -1,0 +1,6 @@
+{
+  "name": "ClipForge Local Studio",
+  "description": "Local-first AI video clipping studio that automatically analyzes long-form videos, detects content categories, selects high-value highlights, and renders vertical 9:16 clips.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

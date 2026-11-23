@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      (function () {
+        var isExtNoise = function (msg, src, stack) {
+          var s = (msg || '') + ' ' + (src || '') + ' ' + (stack || '');
+          return (
+            s.indexOf('chrome-extension://') !== -1 ||
+            s.indexOf('moz-extension://') !== -1 ||
+            s.indexOf('Failed to connect to MetaMask') !== -1
+          );
+        };
+        window.addEventListener(
+          'error',
+          function (e) {
+            if (isExtNoise(e.message, e.filename, e.error && e.error.stack)) {
+              e.preventDefault();
+              e.stopImmediatePropagation();
+            }
+          },
+          true
+        );
+        window.addEventListener(
+          'unhandledrejection',
+          function (e) {
+            var r = e.reason;
+            var msg = typeof r === 'string' ? r : r && r.message;
+            var stack = r && typeof r === 'object' ? r.stack : '';
+            if (isExtNoise(msg, '', stack)) {
+              e.preventDefault();
+              e.stopImmediatePropagation();
+            }
+          },
+          true
+        );
+      })();
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClipForge Local Studio — Universal AI Video Clipping Agent</title>
+    <meta
+      name="description"
+      content="Local-first AI video clipping studio that automatically analyzes long-form videos, detects content categories, selects high-value highlights, and renders vertical 9:16 clips."
+    />
+    <meta property="og:title" content="ClipForge Local Studio — Universal AI Video Clipping Agent" />
+    <meta
+      property="og:description"
+      content="Local-first AI video clipping studio that automatically analyzes long-form videos, detects content categories, selects high-value highlights, and renders vertical 9:16 clips."
+    />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400..700;1,9..40,400..700&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@500;600;700&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body class="bg-[#0B1120] text-slate-100 antialiased selection:bg-blue-500/30 selection:text-blue-100">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
