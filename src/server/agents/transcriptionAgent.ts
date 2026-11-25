@@ -6,8 +6,11 @@ import { promisify } from 'util';
 import type { TranscriptSegment } from '../../types/studio';
 import { PROJECTS_DIR, resolveSafePath } from '../db';
 import {
+  clearModelCooldown,
   getGeminiClient,
+  isModelInCooldown,
   isTransientGeminiError,
+  markModelCooldown,
   withModelFallback,
   withRetry,
 } from '../geminiClient';
@@ -164,77 +167,83 @@ async function transcribeSingleAudioChunk(params: {
 
   let rawJsonText: string | null = null;
 
-  // Step 1: Use dedicated gemini-3.5-transcribe when it yields explicit timestamped lines
-  try {
-    const transcribeResponse = await withRetry(
-      () =>
-        ai.models.generateContent({
-          model: 'gemini-3.5-transcribe',
-          contents: {
-            parts: [
-              {
-                inlineData: {
-                  mimeType: 'audio/mp3',
-                  data: base64Audio,
+  // Step 1: Use dedicated gemini-3.5-transcribe when healthy and yielding explicit timestamped lines
+  if (!isModelInCooldown('gemini-3.5-transcribe')) {
+    try {
+      const transcribeResponse = await withRetry(
+        () =>
+          ai.models.generateContent({
+            model: 'gemini-3.5-transcribe',
+            contents: {
+              parts: [
+                {
+                  inlineData: {
+                    mimeType: 'audio/mp3',
+                    data: base64Audio,
+                  },
                 },
-              },
-              {
-                text: `Transcribe this ${chunkDuration.toFixed(1)}-second audio track verbatim into tightly timed lines.
+                {
+                  text: `Transcribe this ${chunkDuration.toFixed(1)}-second audio track verbatim into tightly timed lines.
 ${hintText}
 ${acousticHint}
 Preserve complete sentence/phrase boundaries and label distinct speakers if audible (e.g. Speaker 1, Host, Guest).
 IMPORTANT: Include REAL acoustic start/end seconds from the audio for every line:
 [start_seconds - end_seconds] Speaker: verbatim text`,
-              },
-            ],
-          },
-        }),
-      1,
-      'audio-transcribe-3.5'
-    );
+                },
+              ],
+            },
+          }),
+        1,
+        'audio-transcribe-3.5'
+      );
 
-    const rawTranscriptText = (transcribeResponse.text ?? '').trim();
-    const lines = rawTranscriptText.split(/\r?\n/).filter((l) => l.trim().length > 0);
-    const timestampedCount = lines.filter((l) =>
-      /\[\s*\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?\s*\]/.test(l)
-    ).length;
+      clearModelCooldown('gemini-3.5-transcribe');
+      const rawTranscriptText = (transcribeResponse.text ?? '').trim();
+      const lines = rawTranscriptText.split(/\r?\n/).filter((l) => l.trim().length > 0);
+      const timestampedCount = lines.filter((l) =>
+        /\[\s*\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?\s*\]/.test(l)
+      ).length;
 
-    // Only structure 3.5-transcribe output when real timestamps were actually emitted;
-    // otherwise let multimodal Gemini listen directly to the audio waveform for accurate sync.
-    if (rawTranscriptText && timestampedCount >= Math.max(1, Math.floor(lines.length * 0.5))) {
-      const structureResponse = await withModelFallback(
-        ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'],
-        (model) =>
-          ai.models.generateContent({
-            model,
-            contents: `Convert the following verbatim timestamped transcript into strictly valid JSON matching the schema.
+      // Only structure 3.5-transcribe output when real timestamps were actually emitted;
+      // otherwise let multimodal Gemini listen directly to the audio waveform for accurate sync.
+      if (rawTranscriptText && timestampedCount >= Math.max(1, Math.floor(lines.length * 0.5))) {
+        const structureResponse = await withModelFallback(
+          ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'],
+          (model) =>
+            ai.models.generateContent({
+              model,
+              contents: `Convert the following verbatim timestamped transcript into strictly valid JSON matching the schema.
 Total media duration is ${chunkDuration.toFixed(2)} seconds.
 ${acousticHint}
 Preserve the exact timestamps from each line, keeping start >= 0, end <= ${chunkDuration.toFixed(2)}, end > start.
 
 Raw Transcript:
 ${rawTranscriptText}`,
-            config: {
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-              responseMimeType: 'application/json',
-              responseSchema: TRANSCRIPT_RESPONSE_SCHEMA,
-            },
-          }),
-        'transcript-structure'
-      );
-      rawJsonText = (structureResponse.text ?? '{}').trim();
-    } else if (rawTranscriptText) {
+              config: {
+                thinkingConfig: {
+                  thinkingLevel: model === 'gemini-3.1-flash-lite' ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW,
+                },
+                responseMimeType: 'application/json',
+                responseSchema: TRANSCRIPT_RESPONSE_SCHEMA,
+              },
+            }),
+          'transcript-structure'
+        );
+        rawJsonText = (structureResponse.text ?? '{}').trim();
+      } else if (rawTranscriptText) {
+        console.log(
+          '[TranscriptionAgent] 3.5-transcribe omitted timestamps; aligning directly against audio waveform with multimodal Gemini.'
+        );
+      }
+    } catch (err) {
+      if (!isTransientGeminiError(err)) {
+        throw err;
+      }
+      markModelCooldown('gemini-3.5-transcribe', 120000);
       console.log(
-        '[TranscriptionAgent] 3.5-transcribe omitted timestamps; aligning directly against audio waveform with multimodal Gemini.'
+        '[TranscriptionAgent] Switching to multimodal audio JSON transcription after temporary 3.5-transcribe unavailability.'
       );
     }
-  } catch (err) {
-    if (!isTransientGeminiError(err)) {
-      throw err;
-    }
-    console.log(
-      '[TranscriptionAgent] Switching to multimodal audio JSON transcription after temporary 3.5-transcribe unavailability.'
-    );
   }
 
   // Step 2: Multimodal audio waveform transcription for exact voice-synced timestamps
@@ -266,7 +275,9 @@ Return strictly valid JSON matching the schema.`,
             ],
           },
           config: {
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            thinkingConfig: {
+              thinkingLevel: model === 'gemini-3.1-flash-lite' ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW,
+            },
             responseMimeType: 'application/json',
             responseSchema: TRANSCRIPT_RESPONSE_SCHEMA,
           },
@@ -394,7 +405,9 @@ Return strictly valid JSON matching the schema.`,
               ],
             },
             config: {
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              thinkingConfig: {
+                thinkingLevel: model === 'gemini-3.1-flash-lite' ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW,
+              },
               responseMimeType: 'application/json',
               responseSchema: TRANSCRIPT_RESPONSE_SCHEMA,
             },
@@ -612,6 +625,9 @@ export async function transcribeProjectAudio(params: {
             fs.unlinkSync(chunkPath);
           } catch {
             // Best-effort cleanup of processed chunk MP3
+          }
+          if (i < totalChunks - 1) {
+            await new Promise((resolve) => setTimeout(resolve, 750));
           }
         }
 
