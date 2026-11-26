@@ -1,4 +1,4 @@
-import { Check, Copy, Download, FileJson, FolderOpen } from 'lucide-react';
+import { Check, Copy, Download, FileJson, FolderOpen, Image as ImageIcon } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import type { ExportRecord } from '../types/studio';
 import { formatBytes, formatDuration, isArabicText } from '../utils/format';
@@ -45,7 +45,7 @@ export function ExportLibraryPage({ exportsList }: ExportLibraryPageProps) {
             Export Library
           </h2>
           <p className="mt-1 text-sm text-slate-400">
-            Local H.264 MP4 + AAC exports organized by project and category, paired with TikTok, Instagram Reels, and YouTube Shorts copy.
+            Local H.264 MP4 + AAC exports organized by project and category, paired with custom 9:16 cover JPGs and social copy.
           </p>
         </div>
 
@@ -103,6 +103,7 @@ export function ExportLibraryPage({ exportsList }: ExportLibraryPageProps) {
                   <div className="w-44 aspect-[9/16] overflow-hidden rounded-xl border border-slate-700 bg-black">
                     <video
                       src={exp.videoUrl}
+                      poster={exp.thumbnailUrl || undefined}
                       preload="metadata"
                       controls
                       playsInline
@@ -136,6 +137,15 @@ export function ExportLibraryPage({ exportsList }: ExportLibraryPageProps) {
                         <Download className="h-3.5 w-3.5" />
                         <span>Download MP4</span>
                       </a>
+                      {exp.thumbnailUrl && (
+                        <a
+                          href={`${exp.thumbnailUrl}?download=1`}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-3.5 py-2 text-xs font-medium text-slate-200 hover:bg-slate-800 whitespace-nowrap"
+                        >
+                          <ImageIcon className="h-3.5 w-3.5" />
+                          <span>Cover JPG</span>
+                        </a>
+                      )}
                       <a
                         href={`${exp.metadataJsonUrl}?download=1`}
                         className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-3.5 py-2 text-xs font-medium text-slate-200 hover:bg-slate-800 whitespace-nowrap"

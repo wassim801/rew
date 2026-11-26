@@ -143,12 +143,13 @@ export default function App() {
   const handleOverrideAnalysis = async (
     projectId: string,
     primaryCategoryId: string,
-    recommendedProfile: EditingProfileId
+    recommendedProfile: EditingProfileId,
+    brief?: string
   ) => {
     const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/analysis`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ primaryCategoryId, recommendedProfile }),
+      body: JSON.stringify({ primaryCategoryId, recommendedProfile, brief }),
     });
     const data = await res.json();
     if (!res.ok) {
@@ -156,7 +157,15 @@ export default function App() {
       return;
     }
     setProjects((prev) =>
-      prev.map((p) => (p.id === projectId ? { ...p, analysis: data.analysis } : p))
+      prev.map((p) =>
+        p.id === projectId
+          ? {
+              ...p,
+              analysis: data.analysis,
+              brief: data.brief !== undefined ? data.brief : p.brief,
+            }
+          : p
+      )
     );
   };
 
@@ -214,6 +223,24 @@ export default function App() {
     status: HighlightRecord['status']
   ) => {
     await handleSaveHighlight(id, { status });
+  };
+
+  const handleRegenerateThumbnail = async (
+    id: string,
+    overrides?: Partial<HighlightRecord>
+  ): Promise<HighlightRecord> => {
+    setErrorBanner(null);
+    const res = await fetch(`/api/highlights/${encodeURIComponent(id)}/regenerate-thumbnail`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(overrides ?? {}),
+    });
+    const data = await parseJsonResponse<{ highlight: HighlightRecord }>(
+      res,
+      'Failed to regenerate highlight thumbnail'
+    );
+    setHighlights((prev) => prev.map((h) => (h.id === id ? data.highlight : h)));
+    return data.highlight;
   };
 
   const handleRenderClip = async (id: string) => {
@@ -436,6 +463,7 @@ export default function App() {
                   project={activeProject}
                   highlights={highlights}
                   onUpdateHighlightStatus={handleUpdateHighlightStatus}
+                  onRegenerateThumbnail={handleRegenerateThumbnail}
                   onOpenInEditor={(id) => {
                     setSelectedHighlightId(id);
                     setActivePage('editor');
@@ -453,6 +481,7 @@ export default function App() {
                   editingProfiles={editingProfiles}
                   onSelectHighlight={setSelectedHighlightId}
                   onSaveHighlight={handleSaveHighlight}
+                  onRegenerateThumbnail={handleRegenerateThumbnail}
                   onRenderClip={handleRenderClip}
                   onAutoHealClip={handleAutoHealClip}
                   onExportClip={handleExportClip}

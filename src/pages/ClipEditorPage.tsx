@@ -3,6 +3,7 @@ import {
   CheckCircle2,
   Download,
   Film,
+  Image as ImageIcon,
   Loader2,
   Pause,
   Play,
@@ -15,12 +16,19 @@ import {
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type {
+  BgmVibe,
+  CameraEnergy,
   CropFocusMode,
   EditingProfileId,
   EditingProfileSpec,
   HighlightRecord,
   ProjectRecord,
+  RemixSegment,
+  SfxCueType,
+  SfxMode,
   SubtitleStylePreset,
+  ThumbnailVibeStyle,
+  TransitionStyle,
 } from '../types/studio';
 import { formatTimecode, isArabicText } from '../utils/format';
 import type { StudioPage } from '../components/Sidebar';
@@ -32,6 +40,10 @@ interface ClipEditorPageProps {
   editingProfiles: EditingProfileSpec[];
   onSelectHighlight: (id: string) => void;
   onSaveHighlight: (id: string, patch: Partial<HighlightRecord>) => Promise<HighlightRecord>;
+  onRegenerateThumbnail: (
+    id: string,
+    overrides?: Partial<HighlightRecord>
+  ) => Promise<HighlightRecord>;
   onRenderClip: (id: string) => Promise<void>;
   onAutoHealClip: (id: string) => Promise<void>;
   onExportClip: (id: string) => Promise<void>;
@@ -47,6 +59,7 @@ export function ClipEditorPage({
   editingProfiles,
   onSelectHighlight,
   onSaveHighlight,
+  onRegenerateThumbnail,
   onRenderClip,
   onAutoHealClip,
   onExportClip,
@@ -79,11 +92,22 @@ export function ClipEditorPage({
   const [dynamicZoom, setDynamicZoom] = useState(false);
   const [normalizeAudio, setNormalizeAudio] = useState(true);
   const [watermarkEnabled, setWatermarkEnabled] = useState(false);
-  const [previewMode, setPreviewMode] = useState<'rendered' | 'source'>('rendered');
+  const [bgmVibe, setBgmVibe] = useState<BgmVibe>('auto');
+  const [transitionStyle, setTransitionStyle] = useState<TransitionStyle>('auto');
+  const [cameraEnergy, setCameraEnergy] = useState<CameraEnergy>('auto');
+  const [sfxMode, setSfxMode] = useState<SfxMode>('auto');
+  const [hookSfx, setHookSfx] = useState<SfxCueType | 'auto' | 'none'>('auto');
+  const [thumbnailText, setThumbnailText] = useState('');
+  const [thumbnailEmojisInput, setThumbnailEmojisInput] = useState('');
+  const [thumbnailStyle, setThumbnailStyle] = useState<ThumbnailVibeStyle>('auto');
+  const [editSegments, setEditSegments] = useState<RemixSegment[]>([]);
+  const [activeSegIdx, setActiveSegIdx] = useState(0);
+  const [previewMode, setPreviewMode] = useState<'rendered' | 'source' | 'thumbnail'>('rendered');
   const [currentPlayTime, setCurrentPlayTime] = useState(0);
 
   const [saving, setSaving] = useState(false);
   const [rendering, setRendering] = useState(false);
+  const [regeneratingThumb, setRegeneratingThumb] = useState(false);
   const [healing, setHealing] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [retryCookie, setRetryCookie] = useState('');
@@ -100,6 +124,7 @@ export function ClipEditorPage({
   const sourceVideoRef = useRef<HTMLVideoElement | null>(null);
   const renderedVideoRef = useRef<HTMLVideoElement | null>(null);
   const attachFileRef = useRef<HTMLInputElement | null>(null);
+  const resumeAutoPlayRef = useRef(false);
 
   useEffect(() => {
     if (!activeHighlight) return;
@@ -115,8 +140,22 @@ export function ClipEditorPage({
     setDynamicZoom(activeHighlight.dynamicZoom);
     setNormalizeAudio(activeHighlight.normalizeAudio);
     setWatermarkEnabled(activeHighlight.watermarkEnabled);
+    setBgmVibe(activeHighlight.bgmVibe ?? 'auto');
+    setTransitionStyle(activeHighlight.transitionStyle ?? 'auto');
+    setCameraEnergy(activeHighlight.cameraEnergy ?? 'auto');
+    setSfxMode(activeHighlight.sfxMode ?? 'auto');
+    setHookSfx(activeHighlight.hookSfx ?? 'auto');
+    setThumbnailText(activeHighlight.thumbnailText ?? '');
+    setThumbnailEmojisInput((activeHighlight.thumbnailEmojis ?? []).join(' '));
+    setThumbnailStyle(activeHighlight.thumbnailStyle ?? 'auto');
+    setEditSegments(activeHighlight.editSegments ? activeHighlight.editSegments.map((s) => ({ ...s })) : []);
+    setActiveSegIdx(0);
     setPreviewMode(activeHighlight.renderedVideoUrl ? 'rendered' : 'source');
-    setCurrentPlayTime(activeHighlight.renderedVideoUrl ? 0 : activeHighlight.startTime);
+    setCurrentPlayTime(
+      activeHighlight.renderedVideoUrl || (activeHighlight.editSegments?.length ?? 0) > 0
+        ? 0
+        : activeHighlight.startTime
+    );
     setIsPlaying(false);
     setVideoError(null);
   }, [activeHighlight?.id, activeHighlight?.renderedVideoUrl]);
@@ -155,16 +194,23 @@ export function ClipEditorPage({
     };
   }, [activeHighlight?.id, project?.id, project?.hasLocalVideoFile, startTime, endTime]);
 
+  const isRemix = editSegments.length > 0;
+  const activeSeg = isRemix ? editSegments[Math.min(activeSegIdx, editSegments.length - 1)] : null;
+  const segStart = activeSeg ? activeSeg.startTime : startTime;
+  const segEnd = activeSeg ? activeSeg.endTime : endTime;
+
   // Keep source preview synced to startTime once video metadata is ready
   useEffect(() => {
     const el = sourceVideoRef.current;
     if (previewMode === 'source' && el && activeHighlight && el.readyState >= 1) {
-      if (Math.abs(el.currentTime - startTime) > 0.25) {
-        el.currentTime = startTime;
+      if (Math.abs(el.currentTime - segStart) > 0.25) {
+        el.currentTime = segStart;
       }
-      setCurrentPlayTime(startTime);
+      if (!isRemix) {
+        setCurrentPlayTime(segStart);
+      }
     }
-  }, [previewMode, startTime, activeHighlight?.id]);
+  }, [previewMode, segStart, activeHighlight?.id, activeSegIdx, isRemix]);
 
   // Build rhythmic 2-4 word display phrases from voice-aligned cues (or weighted project transcript fallback)
   const previewSubtitlePhrases = useMemo(() => {
@@ -239,11 +285,31 @@ export function ClipEditorPage({
   }
 
   const maxSourceDuration = project.metadata?.duration ?? Math.max(endTime, 60);
-  const clipDuration = Math.max(1, endTime - startTime);
+  const remixTotalDuration = isRemix
+    ? Math.max(
+        1,
+        Number(editSegments.reduce((acc, s) => acc + Math.max(0.5, s.endTime - s.startTime), 0).toFixed(2))
+      )
+    : Math.max(1, endTime - startTime);
+  const clipDuration = remixTotalDuration;
+
+  const segOffsetBefore = isRemix
+    ? editSegments
+        .slice(0, activeSegIdx)
+        .reduce((acc, s) => acc + Math.max(0.5, s.endTime - s.startTime), 0)
+    : 0;
+
   const relativePlayTime =
     previewMode === 'rendered' && activeHighlight.renderedVideoUrl
       ? currentPlayTime
+      : isRemix
+      ? Math.max(0, segOffsetBefore + Math.max(0, currentPlayTime - segStart))
       : Math.max(0, currentPlayTime - startTime);
+
+  const activeSourceUrl =
+    isRemix && activeSeg && project.sources?.[activeSeg.sourceIndex]?.sourceUrl
+      ? project.sources[activeSeg.sourceIndex].sourceUrl
+      : project.sourceUrl;
 
   const activeSubtitleCue =
     previewSubtitlePhrases.find((c) => relativePlayTime >= c.start && relativePlayTime <= c.end) ??
@@ -262,6 +328,14 @@ export function ClipEditorPage({
     }
   };
 
+  const parseEmojiTokens = (val: string): string[] => {
+    const tokens = val
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+    return tokens.slice(0, 3);
+  };
+
   const persistCurrentSettings = async () => {
     setSaving(true);
     try {
@@ -269,9 +343,11 @@ export function ClipEditorPage({
         title,
         hookHeadline: hookHeadline.trim() || undefined,
         description,
-        startTime,
-        endTime,
-        duration: Math.max(1, Number((endTime - startTime).toFixed(2))),
+        startTime: isRemix ? 0 : startTime,
+        endTime: isRemix ? remixTotalDuration : endTime,
+        duration: isRemix
+          ? remixTotalDuration
+          : Math.max(1, Number((endTime - startTime).toFixed(2))),
         editingProfile,
         subtitleStyle,
         highlightColor,
@@ -279,9 +355,35 @@ export function ClipEditorPage({
         dynamicZoom,
         normalizeAudio,
         watermarkEnabled,
+        bgmVibe,
+        transitionStyle,
+        cameraEnergy,
+        sfxMode,
+        hookSfx,
+        thumbnailText: thumbnailText.trim() || undefined,
+        thumbnailEmojis: parseEmojiTokens(thumbnailEmojisInput),
+        thumbnailStyle,
+        ...(isRemix ? { editSegments } : {}),
       });
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleRegenerateCover = async () => {
+    setRegeneratingThumb(true);
+    try {
+      const updated = await onRegenerateThumbnail(activeHighlight.id, {
+        thumbnailText: thumbnailText.trim() || undefined,
+        thumbnailEmojis: parseEmojiTokens(thumbnailEmojisInput),
+        thumbnailStyle,
+      });
+      setThumbnailText(updated.thumbnailText ?? thumbnailText);
+      setThumbnailEmojisInput((updated.thumbnailEmojis ?? []).join(' '));
+      if (updated.thumbnailStyle) setThumbnailStyle(updated.thumbnailStyle);
+      setPreviewMode('thumbnail');
+    } finally {
+      setRegeneratingThumb(false);
     }
   };
 
@@ -332,12 +434,13 @@ export function ClipEditorPage({
     setVideoError(null);
 
     if (!el.paused) {
+      resumeAutoPlayRef.current = false;
       el.pause();
       return;
     }
 
-    if (!isRendered && (el.currentTime < startTime - 0.5 || el.currentTime >= endTime - 0.15)) {
-      el.currentTime = startTime;
+    if (!isRendered && (el.currentTime < segStart - 0.5 || el.currentTime >= segEnd - 0.15)) {
+      el.currentTime = segStart;
     }
 
     try {
@@ -349,11 +452,16 @@ export function ClipEditorPage({
 
   const handleRestartSegment = async () => {
     const isRendered = previewMode === 'rendered' && Boolean(activeHighlight.renderedVideoUrl);
+    if (!isRendered && isRemix) {
+      setActiveSegIdx(0);
+      resumeAutoPlayRef.current = true;
+    }
     const el = isRendered ? renderedVideoRef.current : sourceVideoRef.current;
     if (!el) return;
     setVideoError(null);
-    el.currentTime = isRendered ? 0 : startTime;
-    setCurrentPlayTime(isRendered ? 0 : startTime);
+    const targetStart = isRendered ? 0 : isRemix ? editSegments[0]?.startTime ?? 0 : startTime;
+    el.currentTime = targetStart;
+    setCurrentPlayTime(targetStart);
     try {
       await el.play();
     } catch (err) {
@@ -410,34 +518,69 @@ export function ClipEditorPage({
       <div className="grid gap-8 lg:grid-cols-12 items-start">
         {/* Left: 9:16 Vertical Preview */}
         <div className="lg:col-span-5 flex flex-col items-center space-y-4">
-          <div className="flex items-center gap-1 rounded-lg border border-slate-800 bg-slate-900 p-1">
+          <div className="flex flex-wrap items-center justify-center gap-1 rounded-lg border border-slate-800 bg-slate-900 p-1">
             <button
               type="button"
               disabled={!activeHighlight.renderedVideoUrl}
               onClick={() => setPreviewMode('rendered')}
-              className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap disabled:opacity-40 ${
+              className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap disabled:opacity-40 ${
                 previewMode === 'rendered'
                   ? 'bg-slate-800 text-slate-50'
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
-              Rendered 1080×1920 MP4
+              Rendered MP4
             </button>
             <button
               type="button"
               onClick={() => setPreviewMode('source')}
-              className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${
+              className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${
                 previewMode === 'source'
                   ? 'bg-slate-800 text-slate-50'
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
-              Live Source Preview
+              Live Source
+            </button>
+            <button
+              type="button"
+              onClick={() => setPreviewMode('thumbnail')}
+              className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${
+                previewMode === 'thumbnail'
+                  ? 'bg-slate-800 text-slate-50'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Cover Thumbnail
             </button>
           </div>
 
           <div className="relative w-full max-w-[320px] aspect-[9/16] overflow-hidden rounded-2xl border border-slate-700 bg-black">
-            {previewMode === 'rendered' && activeHighlight.renderedVideoUrl ? (
+            {previewMode === 'thumbnail' ? (
+              activeHighlight.thumbnailUrl ? (
+                <img
+                  key={activeHighlight.thumbnailUrl}
+                  src={activeHighlight.thumbnailUrl}
+                  alt={`Cover thumbnail for ${activeHighlight.title}`}
+                  className="h-full w-full object-cover"
+                />
+              ) : (
+                <div className="flex h-full w-full flex-col items-center justify-center gap-3 p-6 text-center">
+                  <ImageIcon className="h-9 w-9 text-slate-600" />
+                  <p className="text-xs text-slate-400">
+                    No cover thumbnail generated for this highlight yet.
+                  </p>
+                  <button
+                    type="button"
+                    disabled={regeneratingThumb}
+                    onClick={handleRegenerateCover}
+                    className="rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-medium text-white hover:bg-blue-500 disabled:opacity-50"
+                  >
+                    {regeneratingThumb ? 'Designing Cover...' : 'Generate Cover Thumbnail'}
+                  </button>
+                </div>
+              )
+            ) : previewMode === 'rendered' && activeHighlight.renderedVideoUrl ? (
               <video
                 key={activeHighlight.renderedVideoUrl}
                 ref={renderedVideoRef}
@@ -481,28 +624,32 @@ export function ClipEditorPage({
             ) : (
               <>
                 <video
-                  key={project.sourceUrl}
+                  key={`${activeSourceUrl}_${activeSegIdx}`}
                   ref={sourceVideoRef}
-                  src={project.sourceUrl}
+                  src={activeSourceUrl}
                   preload="metadata"
                   controls
                   playsInline
                   onLoadedMetadata={(e) => {
                     setVideoError(null);
                     setVideoBuffering(false);
-                    if (Math.abs(e.currentTarget.currentTime - startTime) > 0.25) {
-                      e.currentTarget.currentTime = startTime;
+                    if (Math.abs(e.currentTarget.currentTime - segStart) > 0.25) {
+                      e.currentTarget.currentTime = segStart;
                     }
-                    setCurrentPlayTime(startTime);
+                    setCurrentPlayTime(segStart);
+                    if (resumeAutoPlayRef.current) {
+                      resumeAutoPlayRef.current = false;
+                      void e.currentTarget.play().catch(() => undefined);
+                    }
                   }}
                   onCanPlay={() => setVideoBuffering(false)}
                   onWaiting={() => setVideoBuffering(true)}
                   onPlay={(e) => {
                     if (
-                      e.currentTarget.currentTime < startTime - 0.5 ||
-                      e.currentTarget.currentTime >= endTime - 0.15
+                      e.currentTarget.currentTime < segStart - 0.5 ||
+                      e.currentTarget.currentTime >= segEnd - 0.15
                     ) {
-                      e.currentTarget.currentTime = startTime;
+                      e.currentTarget.currentTime = segStart;
                     }
                     setIsPlaying(true);
                     setVideoError(null);
@@ -516,10 +663,25 @@ export function ClipEditorPage({
                   onTimeUpdate={(e) => {
                     const t = e.currentTarget.currentTime;
                     setCurrentPlayTime(t);
-                    if (t >= endTime) {
-                      e.currentTarget.pause();
-                      e.currentTarget.currentTime = startTime;
-                      setIsPlaying(false);
+                    if (t >= segEnd) {
+                      if (isRemix && activeSegIdx + 1 < editSegments.length) {
+                        const nextIdx = activeSegIdx + 1;
+                        const nextSeg = editSegments[nextIdx];
+                        if (nextSeg.sourceIndex === activeSeg?.sourceIndex) {
+                          setActiveSegIdx(nextIdx);
+                          e.currentTarget.currentTime = nextSeg.startTime;
+                        } else {
+                          resumeAutoPlayRef.current = true;
+                          setActiveSegIdx(nextIdx);
+                        }
+                      } else {
+                        e.currentTarget.pause();
+                        if (isRemix) setActiveSegIdx(0);
+                        e.currentTarget.currentTime = isRemix
+                          ? editSegments[0]?.startTime ?? 0
+                          : startTime;
+                        setIsPlaying(false);
+                      }
                     }
                   }}
                   onError={() => {
@@ -626,8 +788,33 @@ export function ClipEditorPage({
             )}
           </div>
 
-          {/* Segment Playback Controls */}
-          {!(project.hasLocalVideoFile === false && project.youtubeVideoId && previewMode === 'source') && (
+          {/* Segment Playback Controls or Thumbnail Cover Controls */}
+          {previewMode === 'thumbnail' ? (
+            <div className="w-full max-w-[320px] flex items-center gap-2">
+              <button
+                type="button"
+                disabled={regeneratingThumb}
+                onClick={handleRegenerateCover}
+                className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs font-medium text-slate-100 hover:bg-slate-800 disabled:opacity-50"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 text-blue-400 ${regeneratingThumb ? 'animate-spin' : ''}`} />
+                <span>{regeneratingThumb ? 'Designing...' : 'Regenerate Cover'}</span>
+              </button>
+              {activeHighlight.thumbnailUrl && (
+                <a
+                  href={
+                    activeHighlight.thumbnailUrl.includes('?')
+                      ? `${activeHighlight.thumbnailUrl}&download=1`
+                      : `${activeHighlight.thumbnailUrl}?download=1`
+                  }
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-500 whitespace-nowrap"
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  <span>JPG</span>
+                </a>
+              )}
+            </div>
+          ) : !(project.hasLocalVideoFile === false && project.youtubeVideoId && previewMode === 'source') && (
             <div className="w-full max-w-[320px] space-y-2">
               <div className="flex items-center gap-2">
                 <button
@@ -693,7 +880,9 @@ export function ClipEditorPage({
           )}
 
           <p className="text-center text-xs text-slate-400 max-w-xs">
-            {previewMode === 'rendered' && activeHighlight.renderedVideoUrl
+            {previewMode === 'thumbnail'
+              ? '720×1280 9:16 stylized cover artwork matched to this highlight scene, hook writing, emojis, and overall video vibe.'
+              : previewMode === 'rendered' && activeHighlight.renderedVideoUrl
               ? 'Playing actual FFmpeg-rendered 1080×1920 montage with voice-synced karaoke subtitles, hook card, and EBU R128 audio.'
               : project.hasLocalVideoFile === false && project.youtubeVideoId
               ? 'Previewing YouTube segment directly. Attach local MP4 or download with cookies below to unlock FFmpeg 9:16 rendering.'
@@ -806,42 +995,149 @@ export function ClipEditorPage({
                 />
               </label>
 
-              {/* Trim Start / End */}
-              <div>
-                <div className="flex justify-between text-xs text-slate-300">
-                  <span>Start Time</span>
-                  <span className="font-mono tabular-nums text-blue-400">
-                    {formatTimecode(startTime)}
-                  </span>
+              {isRemix ? (
+                <div className="sm:col-span-2 space-y-2.5 border-t border-slate-800 pt-4">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-medium text-slate-200">
+                      Mix-and-Match Remix Cuts ({editSegments.length} segments · {remixTotalDuration.toFixed(1)}s)
+                    </span>
+                    <span className="text-slate-400">Click a cut to preview in player</span>
+                  </div>
+                  <div className="space-y-2">
+                    {editSegments.map((seg, sIdx) => {
+                      const srcDur = project.sources?.[seg.sourceIndex]?.metadata?.duration ?? 180;
+                      return (
+                        <div
+                          key={seg.id || sIdx}
+                          onClick={() => {
+                            if (previewMode === 'source') {
+                              setActiveSegIdx(sIdx);
+                            }
+                          }}
+                          className={`flex flex-wrap items-center justify-between gap-3 rounded-lg border px-3 py-2 text-xs transition-colors ${
+                            previewMode === 'source' && activeSegIdx === sIdx
+                              ? 'border-blue-500/60 bg-blue-500/10'
+                              : 'border-slate-800 bg-slate-900/70 hover:border-slate-700'
+                          }`}
+                        >
+                          <div className="min-w-0 flex items-center gap-2">
+                            <span className="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] uppercase text-blue-400">
+                              {seg.role}
+                            </span>
+                            <span className="font-medium text-slate-200 truncate">
+                              Clip #{seg.sourceIndex + 1}: {seg.sourceFilename}
+                            </span>
+                          </div>
+                          <div
+                            className="flex items-center gap-2 font-mono"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <label className="flex items-center gap-1 text-slate-400">
+                              <span>In</span>
+                              <input
+                                type="number"
+                                min={0}
+                                max={Math.max(0, seg.endTime - 1.5)}
+                                step={0.2}
+                                value={seg.startTime}
+                                onChange={(e) => {
+                                  const v = Math.max(0, Math.min(seg.endTime - 1.5, Number(e.target.value) || 0));
+                                  setEditSegments((prev) =>
+                                    prev.map((item, i) => (i === sIdx ? { ...item, startTime: Number(v.toFixed(2)) } : item))
+                                  );
+                                }}
+                                className="w-16 rounded border border-slate-700 bg-slate-950 px-1.5 py-1 text-xs text-slate-100"
+                              />
+                            </label>
+                            <label className="flex items-center gap-1 text-slate-400">
+                              <span>Out</span>
+                              <input
+                                type="number"
+                                min={seg.startTime + 1.5}
+                                max={srcDur}
+                                step={0.2}
+                                value={seg.endTime}
+                                onChange={(e) => {
+                                  const v = Math.min(srcDur, Math.max(seg.startTime + 1.5, Number(e.target.value) || seg.startTime + 2));
+                                  setEditSegments((prev) =>
+                                    prev.map((item, i) => (i === sIdx ? { ...item, endTime: Number(v.toFixed(2)) } : item))
+                                  );
+                                }}
+                                className="w-16 rounded border border-slate-700 bg-slate-950 px-1.5 py-1 text-xs text-slate-100"
+                              />
+                            </label>
+                            <select
+                              aria-label="Segment Sound Effect"
+                              value={seg.sfxCue ?? 'auto'}
+                              onChange={(e) => {
+                                const val = e.target.value as SfxCueType | 'auto' | 'none';
+                                setEditSegments((prev) =>
+                                  prev.map((item, i) =>
+                                    i === sIdx
+                                      ? { ...item, sfxCue: val === 'auto' ? undefined : val }
+                                      : item
+                                  )
+                                );
+                              }}
+                              className="rounded border border-slate-700 bg-slate-950 px-1.5 py-1 text-[11px] font-sans text-slate-200"
+                            >
+                              <option value="auto">SFX: Auto Scene</option>
+                              <option value="shock-boom">Shock Boom</option>
+                              <option value="buzz-zap">Buzz / Zap</option>
+                              <option value="clever-ding">Clever Ding</option>
+                              <option value="mouse-click">Mouse Click</option>
+                              <option value="pop-bubble">Pop Bubble</option>
+                              <option value="cash-sparkle">Sparkle Reveal</option>
+                              <option value="whoosh-swish">Whoosh Cut</option>
+                              <option value="riser-hit">Riser Hit</option>
+                              <option value="none">No SFX</option>
+                            </select>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
-                <input
-                  type="range"
-                  min={0}
-                  max={Math.max(0, endTime - 2)}
-                  step={0.1}
-                  value={startTime}
-                  onChange={(e) => setStartTime(Number(e.target.value))}
-                  className="mt-2 w-full accent-blue-500"
-                />
-              </div>
+              ) : (
+                <>
+                  {/* Trim Start / End */}
+                  <div>
+                    <div className="flex justify-between text-xs text-slate-300">
+                      <span>Start Time</span>
+                      <span className="font-mono tabular-nums text-blue-400">
+                        {formatTimecode(startTime)}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={Math.max(0, endTime - 2)}
+                      step={0.1}
+                      value={startTime}
+                      onChange={(e) => setStartTime(Number(e.target.value))}
+                      className="mt-2 w-full accent-blue-500"
+                    />
+                  </div>
 
-              <div>
-                <div className="flex justify-between text-xs text-slate-300">
-                  <span>End Time</span>
-                  <span className="font-mono tabular-nums text-blue-400">
-                    {formatTimecode(endTime)}
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={Math.min(maxSourceDuration, startTime + 2)}
-                  max={maxSourceDuration}
-                  step={0.1}
-                  value={endTime}
-                  onChange={(e) => setEndTime(Number(e.target.value))}
-                  className="mt-2 w-full accent-blue-500"
-                />
-              </div>
+                  <div>
+                    <div className="flex justify-between text-xs text-slate-300">
+                      <span>End Time</span>
+                      <span className="font-mono tabular-nums text-blue-400">
+                        {formatTimecode(endTime)}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={Math.min(maxSourceDuration, startTime + 2)}
+                      max={maxSourceDuration}
+                      step={0.1}
+                      value={endTime}
+                      onChange={(e) => setEndTime(Number(e.target.value))}
+                      className="mt-2 w-full accent-blue-500"
+                    />
+                  </div>
+                </>
+              )}
             </div>
 
             {/* Adaptive Editing Profile & Framing */}
@@ -902,6 +1198,176 @@ export function ClipEditorPage({
                   <span className="font-mono text-xs text-slate-300">{highlightColor}</span>
                 </div>
               </label>
+
+              <label className="block text-xs font-medium text-slate-300">
+                Background Music (Auto-Ducked)
+                <select
+                  value={bgmVibe}
+                  onChange={(e) => setBgmVibe(e.target.value as BgmVibe)}
+                  className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:border-blue-500 focus:outline-none"
+                >
+                  <option value="auto">Auto Match Vibe &amp; Brief</option>
+                  <option value="upbeat-pop">Upbeat Lifestyle / Holiday Pop</option>
+                  <option value="lofi-warm">Warm Lo-Fi Chill Groove</option>
+                  <option value="hype-beat">Energetic Hype Beat</option>
+                  <option value="cinematic-warm">Cinematic Warm Emotional Pad</option>
+                  <option value="none">Voice Only (No Music)</option>
+                </select>
+              </label>
+
+              <label className="block text-xs font-medium text-slate-300">
+                Cut Transitions
+                <select
+                  value={transitionStyle}
+                  onChange={(e) => setTransitionStyle(e.target.value as TransitionStyle)}
+                  className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:border-blue-500 focus:outline-none"
+                >
+                  <option value="auto">Auto Match Editing Profile</option>
+                  <option value="whip-slide">Whip Slide &amp; Smooth Push</option>
+                  <option value="zoom-punch">Circle Open &amp; Radial Blur</option>
+                  <option value="dissolve">Smooth Dissolve &amp; Fade</option>
+                  <option value="flash-cut">Flash Cut &amp; Motion Blur</option>
+                  <option value="hard-cut">Clean Snap Hard Cut</option>
+                </select>
+              </label>
+
+              <label className="block text-xs font-medium text-slate-300">
+                Camera Motion &amp; Impact Vibration
+                <select
+                  value={cameraEnergy}
+                  onChange={(e) => setCameraEnergy(e.target.value as CameraEnergy)}
+                  className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:border-blue-500 focus:outline-none"
+                >
+                  <option value="auto">Auto Match Profile</option>
+                  <option value="viral-shake">Viral Impact Shake + Fast Zoom In/Out</option>
+                  <option value="dynamic">Dynamic Zoom In / Zoom Out Pullback</option>
+                  <option value="calm">Steady / Gentle Framing</option>
+                </select>
+              </label>
+
+              <label className="block text-xs font-medium text-slate-300">
+                Scene Sound Effects (SFX)
+                <select
+                  value={sfxMode}
+                  onChange={(e) => setSfxMode(e.target.value as SfxMode)}
+                  className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:border-blue-500 focus:outline-none"
+                >
+                  <option value="auto">Auto Match Scene &amp; Brief</option>
+                  <option value="playful-viral">Playful Viral (Pops, Buzz, Sparkle, Ding)</option>
+                  <option value="dramatic-impact">Dramatic Impact (Shock Boom, Riser, Whoosh)</option>
+                  <option value="smart-ui">Smart &amp; Clever (Mouse Click, Lightbulb Ding)</option>
+                  <option value="subtle-clean">Subtle Pro Transitions</option>
+                  <option value="none">No Sound Effects</option>
+                </select>
+              </label>
+
+              <label className="block text-xs font-medium text-slate-300 sm:col-span-2">
+                Opening Hook Sound Effect
+                <select
+                  value={hookSfx}
+                  onChange={(e) => setHookSfx(e.target.value as SfxCueType | 'auto' | 'none')}
+                  disabled={sfxMode === 'none'}
+                  className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:border-blue-500 focus:outline-none disabled:opacity-45"
+                >
+                  <option value="auto">Auto Match Hook Emotion</option>
+                  <option value="shock-boom">Shock / Dramatic Boom</option>
+                  <option value="clever-ding">Clever Lightbulb Ding</option>
+                  <option value="buzz-zap">Electric Buzz / Zap</option>
+                  <option value="mouse-click">Mouse Click / UI Pop</option>
+                  <option value="pop-bubble">Playful Bubble Pop</option>
+                  <option value="cash-sparkle">Gift / Reveal Sparkle</option>
+                  <option value="whoosh-swish">Fast Air Whoosh</option>
+                  <option value="riser-hit">Suspense Riser Hit</option>
+                  <option value="none">No Opening Sound</option>
+                </select>
+              </label>
+
+              {/* Cover Thumbnail & Vibe Controls */}
+              <div className="sm:col-span-2 border-t border-slate-800 pt-4 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h4 className="text-xs font-semibold text-slate-100">
+                      Cover Thumbnail &amp; Vibe Design
+                    </h4>
+                    <p className="text-[11px] text-slate-400">
+                      Custom 9:16 cover writing, expressive emojis, and graphic art direction matched to this clip.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={regeneratingThumb}
+                    onClick={handleRegenerateCover}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-blue-500/40 bg-blue-500/10 px-3 py-1.5 text-xs font-medium text-blue-300 hover:bg-blue-500/20 disabled:opacity-50 whitespace-nowrap"
+                  >
+                    <RefreshCw className={`h-3.5 w-3.5 ${regeneratingThumb ? 'animate-spin' : ''}`} />
+                    <span>{regeneratingThumb ? 'Designing Cover...' : 'Apply & Regenerate Cover'}</span>
+                  </button>
+                </div>
+
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <label className="block text-xs font-medium text-slate-300">
+                    Thumbnail Design Vibe
+                    <select
+                      value={thumbnailStyle}
+                      onChange={(e) => setThumbnailStyle(e.target.value as ThumbnailVibeStyle)}
+                      className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:border-blue-500 focus:outline-none"
+                    >
+                      <option value="auto">Auto Match Video Vibe</option>
+                      <option value="viral-pop">Viral Pop (Diagonal Accent &amp; Glow)</option>
+                      <option value="lifestyle-warm">Lifestyle / Holiday Warm (Editorial Blush)</option>
+                      <option value="comedy-sticker">Comedy Sticker Card (Bold Pop Outline)</option>
+                      <option value="cinematic-editorial">Cinematic Editorial (Serif &amp; Hairline)</option>
+                      <option value="tech-neon">Tech &amp; Gaming Neon (HUD Brackets)</option>
+                      <option value="podcast-quote">Podcast Quote (Studio Statement)</option>
+                    </select>
+                  </label>
+
+                  <label className="block text-xs font-medium text-slate-300">
+                    Cover Writing (2–5 punchy words)
+                    <input
+                      type="text"
+                      dir={rtl ? 'rtl' : 'ltr'}
+                      value={thumbnailText}
+                      onChange={(e) => setThumbnailText(e.target.value)}
+                      placeholder="SAINT NIC TAX"
+                      className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-blue-500 focus:outline-none"
+                    />
+                  </label>
+
+                  <div className="sm:col-span-2 space-y-2">
+                    <label className="block text-xs font-medium text-slate-300">
+                      Cover Emojis (space-separated, up to 3)
+                      <input
+                        type="text"
+                        value={thumbnailEmojisInput}
+                        onChange={(e) => setThumbnailEmojisInput(e.target.value)}
+                        placeholder="🎅 🎁 ✨"
+                        className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-blue-500 focus:outline-none"
+                      />
+                    </label>
+                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                      <span className="text-[11px] text-slate-400">Quick packs:</span>
+                      {[
+                        '🎅 🎁 ✨',
+                        '😭 💀 🔥',
+                        '😱 🚨 👀',
+                        '💖 ✨ 💁‍♀️',
+                        '🎙️ 💯 🔥',
+                        '⚡ 🧠 🚀',
+                      ].map((pack) => (
+                        <button
+                          key={pack}
+                          type="button"
+                          onClick={() => setThumbnailEmojisInput(pack)}
+                          className="rounded border border-slate-700 bg-slate-900 px-2 py-0.5 text-xs text-slate-200 hover:border-slate-500"
+                        >
+                          {pack}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </div>
             </div>
 
             <div className="flex flex-wrap gap-6 border-t border-slate-800 pt-4 text-xs text-slate-200">

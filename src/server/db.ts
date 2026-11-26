@@ -7,8 +7,11 @@ import type {
   HighlightRecord,
   PipelineStage,
   ProjectRecord,
+  ProjectSourceVideo,
+  RemixSegment,
   SceneKeyframe,
   StudioSettings,
+  ThumbnailVibeStyle,
   TranscriptSegment,
   VideoMetadata,
 } from '../types/studio';
@@ -140,12 +143,61 @@ if (!projectCols.includes('youtube_video_id')) {
 if (!projectCols.includes('has_local_video')) {
   db.exec(`ALTER TABLE projects ADD COLUMN has_local_video INTEGER NOT NULL DEFAULT 1`);
 }
+if (!projectCols.includes('brief')) {
+  db.exec(`ALTER TABLE projects ADD COLUMN brief TEXT`);
+}
+if (!projectCols.includes('sources_json')) {
+  db.exec(`ALTER TABLE projects ADD COLUMN sources_json TEXT`);
+}
 
 const highlightCols = (
   db.prepare(`PRAGMA table_info(highlights)`).all() as Array<{ name: string }>
 ).map((c) => c.name);
 if (!highlightCols.includes('hook_headline')) {
   db.exec(`ALTER TABLE highlights ADD COLUMN hook_headline TEXT`);
+}
+if (!highlightCols.includes('edit_segments_json')) {
+  db.exec(`ALTER TABLE highlights ADD COLUMN edit_segments_json TEXT`);
+}
+if (!highlightCols.includes('bgm_vibe')) {
+  db.exec(`ALTER TABLE highlights ADD COLUMN bgm_vibe TEXT DEFAULT 'auto'`);
+}
+if (!highlightCols.includes('transition_style')) {
+  db.exec(`ALTER TABLE highlights ADD COLUMN transition_style TEXT DEFAULT 'auto'`);
+}
+if (!highlightCols.includes('camera_energy')) {
+  db.exec(`ALTER TABLE highlights ADD COLUMN camera_energy TEXT DEFAULT 'auto'`);
+}
+if (!highlightCols.includes('sfx_mode')) {
+  db.exec(`ALTER TABLE highlights ADD COLUMN sfx_mode TEXT DEFAULT 'auto'`);
+}
+if (!highlightCols.includes('hook_sfx')) {
+  db.exec(`ALTER TABLE highlights ADD COLUMN hook_sfx TEXT DEFAULT 'auto'`);
+}
+if (!highlightCols.includes('thumbnail_path')) {
+  db.exec(`ALTER TABLE highlights ADD COLUMN thumbnail_path TEXT`);
+}
+if (!highlightCols.includes('thumbnail_url')) {
+  db.exec(`ALTER TABLE highlights ADD COLUMN thumbnail_url TEXT`);
+}
+if (!highlightCols.includes('thumbnail_text')) {
+  db.exec(`ALTER TABLE highlights ADD COLUMN thumbnail_text TEXT`);
+}
+if (!highlightCols.includes('thumbnail_emojis_json')) {
+  db.exec(`ALTER TABLE highlights ADD COLUMN thumbnail_emojis_json TEXT`);
+}
+if (!highlightCols.includes('thumbnail_style')) {
+  db.exec(`ALTER TABLE highlights ADD COLUMN thumbnail_style TEXT DEFAULT 'auto'`);
+}
+if (!highlightCols.includes('thumbnail_timestamp')) {
+  db.exec(`ALTER TABLE highlights ADD COLUMN thumbnail_timestamp REAL`);
+}
+
+const exportCols = (
+  db.prepare(`PRAGMA table_info(exports)`).all() as Array<{ name: string }>
+).map((c) => c.name);
+if (!exportCols.includes('thumbnail_url')) {
+  db.exec(`ALTER TABLE exports ADD COLUMN thumbnail_url TEXT`);
 }
 
 export interface ProjectRowInternal extends ProjectRecord {
@@ -155,12 +207,25 @@ export interface ProjectRowInternal extends ProjectRecord {
 
 export interface HighlightRowInternal extends HighlightRecord {
   renderedVideoPath: string | null;
+  thumbnailPath: string | null;
 }
 
 function mapProjectRow(row: Record<string, unknown>): ProjectRowInternal {
+  let sources: ProjectSourceVideo[] | undefined;
+  if (row.sources_json) {
+    try {
+      const parsed = JSON.parse(String(row.sources_json)) as ProjectSourceVideo[];
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        sources = parsed;
+      }
+    } catch {
+      sources = undefined;
+    }
+  }
   return {
     id: String(row.id),
     title: String(row.title),
+    brief: row.brief ? String(row.brief) : undefined,
     sourceFilename: String(row.source_filename),
     sourcePath: String(row.source_path),
     sourceUrl: String(row.source_url),
@@ -176,12 +241,44 @@ function mapProjectRow(row: Record<string, unknown>): ProjectRowInternal {
     transcript: JSON.parse(String(row.transcript_json || '[]')) as TranscriptSegment[],
     scenes: JSON.parse(String(row.scenes_json || '[]')) as SceneKeyframe[],
     analysis: row.analysis_json ? (JSON.parse(String(row.analysis_json)) as ContentAnalysis) : null,
+    sources,
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
 }
 
+function sanitizeProjectForPublic(row: ProjectRowInternal): ProjectRecord {
+  const { sourcePath: _sp, audioPath: _ap, sources, ...pub } = row;
+  if (!sources) return pub;
+  return {
+    ...pub,
+    sources: sources.map(({ sourcePath: _ssp, audioPath: _sap, ...rest }) => rest),
+  };
+}
+
 function mapHighlightRow(row: Record<string, unknown>): HighlightRowInternal {
+  let editSegments: RemixSegment[] | undefined;
+  if (row.edit_segments_json) {
+    try {
+      const parsed = JSON.parse(String(row.edit_segments_json)) as RemixSegment[];
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        editSegments = parsed;
+      }
+    } catch {
+      editSegments = undefined;
+    }
+  }
+  let thumbnailEmojis: string[] | undefined;
+  if (row.thumbnail_emojis_json) {
+    try {
+      const parsed = JSON.parse(String(row.thumbnail_emojis_json)) as string[];
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        thumbnailEmojis = parsed.map(String);
+      }
+    } catch {
+      thumbnailEmojis = undefined;
+    }
+  }
   return {
     id: String(row.id),
     projectId: String(row.project_id),
@@ -208,6 +305,21 @@ function mapHighlightRow(row: Record<string, unknown>): HighlightRowInternal {
     renderedVideoPath: row.rendered_video_path ? String(row.rendered_video_path) : null,
     renderedVideoUrl: row.rendered_video_url ? String(row.rendered_video_url) : null,
     qcReport: row.qc_report_json ? JSON.parse(String(row.qc_report_json)) : null,
+    editSegments,
+    bgmVibe: (row.bgm_vibe ? String(row.bgm_vibe) : 'auto') as HighlightRecord['bgmVibe'],
+    transitionStyle: (row.transition_style ? String(row.transition_style) : 'auto') as HighlightRecord['transitionStyle'],
+    cameraEnergy: (row.camera_energy ? String(row.camera_energy) : 'auto') as HighlightRecord['cameraEnergy'],
+    sfxMode: (row.sfx_mode ? String(row.sfx_mode) : 'auto') as HighlightRecord['sfxMode'],
+    hookSfx: (row.hook_sfx ? String(row.hook_sfx) : 'auto') as HighlightRecord['hookSfx'],
+    thumbnailPath: row.thumbnail_path ? String(row.thumbnail_path) : null,
+    thumbnailUrl: row.thumbnail_url ? String(row.thumbnail_url) : null,
+    thumbnailText: row.thumbnail_text ? String(row.thumbnail_text) : undefined,
+    thumbnailEmojis,
+    thumbnailStyle: (row.thumbnail_style ? String(row.thumbnail_style) : 'auto') as ThumbnailVibeStyle,
+    thumbnailTimestamp:
+      row.thumbnail_timestamp !== null && row.thumbnail_timestamp !== undefined
+        ? Number(row.thumbnail_timestamp)
+        : undefined,
   };
 }
 
@@ -222,6 +334,7 @@ function mapExportRow(row: Record<string, unknown>): ExportRecord {
     categoryName: String(row.category_name),
     editingProfile: row.editing_profile as ExportRecord['editingProfile'],
     videoUrl: String(row.video_url),
+    thumbnailUrl: row.thumbnail_url ? String(row.thumbnail_url) : null,
     metadataJsonUrl: String(row.metadata_json_url),
     outputDir: String(row.output_dir),
     resolution: String(row.resolution),
@@ -236,26 +349,33 @@ export const store = {
   createProject(params: {
     id: string;
     title: string;
+    brief?: string;
     sourceFilename: string;
     sourcePath: string;
     sourceUrl: string;
     youtubeVideoId?: string | null;
     hasLocalVideoFile?: boolean;
+    sources?: ProjectSourceVideo[];
   }): ProjectRowInternal {
     const now = new Date().toISOString();
+    const cleanBrief = params.brief?.trim() ? params.brief.trim().slice(0, 8000) : null;
+    const sourcesJson =
+      params.sources && params.sources.length > 0 ? JSON.stringify(params.sources) : null;
     db.prepare(
       `INSERT INTO projects (
-        id, title, source_filename, source_path, source_url, youtube_video_id, has_local_video,
-        status, current_stage, stage_progress, stage_message, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'processing', 'queued', 0, 'Queued for ingestion', ?, ?)`
+        id, title, brief, source_filename, source_path, source_url, youtube_video_id, has_local_video,
+        sources_json, status, current_stage, stage_progress, stage_message, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', 'queued', 0, 'Queued for ingestion', ?, ?)`
     ).run(
       params.id,
       params.title,
+      cleanBrief,
       params.sourceFilename,
       params.sourcePath,
       params.sourceUrl,
       params.youtubeVideoId ?? null,
       params.hasLocalVideoFile === false ? 0 : 1,
+      sourcesJson,
       now,
       now
     );
@@ -267,17 +387,13 @@ export const store = {
       string,
       unknown
     >[];
-    return rows.map((r) => {
-      const { sourcePath: _sp, audioPath: _ap, ...pub } = mapProjectRow(r);
-      return pub;
-    });
+    return rows.map((r) => sanitizeProjectForPublic(mapProjectRow(r)));
   },
 
   getProject(id: string): ProjectRecord | null {
     const row = this.getProjectInternal(id);
     if (!row) return null;
-    const { sourcePath: _sp, audioPath: _ap, ...pub } = row;
-    return pub;
+    return sanitizeProjectForPublic(row);
   },
 
   getProjectInternal(id: string): ProjectRowInternal | null {
@@ -310,6 +426,15 @@ export const store = {
   updateProjectTitle(id: string, title: string): void {
     db.prepare(`UPDATE projects SET title = ?, updated_at = ? WHERE id = ?`).run(
       title,
+      new Date().toISOString(),
+      id
+    );
+  },
+
+  updateProjectBrief(id: string, brief: string): void {
+    const cleanBrief = brief.trim() ? brief.trim().slice(0, 8000) : null;
+    db.prepare(`UPDATE projects SET brief = ?, updated_at = ? WHERE id = ?`).run(
+      cleanBrief,
       new Date().toISOString(),
       id
     );
@@ -361,6 +486,38 @@ export const store = {
     );
   },
 
+  saveMultiSourceIngestion(
+    id: string,
+    sources: ProjectSourceVideo[],
+    mergedMetadata: VideoMetadata,
+    mergedScenes: SceneKeyframe[]
+  ): void {
+    db.prepare(
+      `UPDATE projects SET sources_json = ?, metadata_json = ?, scenes_json = ?, updated_at = ? WHERE id = ?`
+    ).run(
+      JSON.stringify(sources),
+      JSON.stringify(mergedMetadata),
+      JSON.stringify(mergedScenes),
+      new Date().toISOString(),
+      id
+    );
+  },
+
+  saveMultiSourceTranscript(
+    id: string,
+    sources: ProjectSourceVideo[],
+    mergedTranscript: TranscriptSegment[]
+  ): void {
+    db.prepare(
+      `UPDATE projects SET sources_json = ?, transcript_json = ?, updated_at = ? WHERE id = ?`
+    ).run(
+      JSON.stringify(sources),
+      JSON.stringify(mergedTranscript),
+      new Date().toISOString(),
+      id
+    );
+  },
+
   saveAnalysis(id: string, analysis: ContentAnalysis): void {
     db.prepare(`UPDATE projects SET analysis_json = ?, updated_at = ? WHERE id = ?`).run(
       JSON.stringify(analysis),
@@ -382,8 +539,10 @@ export const store = {
         keywords_json, criteria_breakdown_json, status, editing_profile,
         subtitle_style, highlight_color, crop_mode, dynamic_zoom, normalize_audio,
         watermark_enabled, rendered_video_path, rendered_video_url, qc_report_json,
+        edit_segments_json, bgm_vibe, transition_style, camera_energy, sfx_mode, hook_sfx,
+        thumbnail_path, thumbnail_url, thumbnail_text, thumbnail_emojis_json, thumbnail_style, thumbnail_timestamp,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const now = new Date().toISOString();
     const tx = db.transaction(() => {
@@ -415,6 +574,20 @@ export const store = {
           null,
           h.renderedVideoUrl,
           h.qcReport ? JSON.stringify(h.qcReport) : null,
+          h.editSegments && h.editSegments.length > 0 ? JSON.stringify(h.editSegments) : null,
+          h.bgmVibe ?? 'auto',
+          h.transitionStyle ?? 'auto',
+          h.cameraEnergy ?? 'auto',
+          h.sfxMode ?? 'auto',
+          h.hookSfx ?? 'auto',
+          null,
+          h.thumbnailUrl ?? null,
+          h.thumbnailText ?? null,
+          h.thumbnailEmojis && h.thumbnailEmojis.length > 0
+            ? JSON.stringify(h.thumbnailEmojis)
+            : null,
+          h.thumbnailStyle ?? 'auto',
+          h.thumbnailTimestamp ?? null,
           now,
           now
         );
@@ -433,7 +606,7 @@ export const store = {
           unknown
         >[]);
     return rows.map((r) => {
-      const { renderedVideoPath: _rvp, ...pub } = mapHighlightRow(r);
+      const { renderedVideoPath: _rvp, thumbnailPath: _tp, ...pub } = mapHighlightRow(r);
       return pub;
     });
   },
@@ -465,6 +638,18 @@ export const store = {
       renderedVideoPath: string | null;
       renderedVideoUrl: string | null;
       qcReport: HighlightRecord['qcReport'];
+      editSegments: HighlightRecord['editSegments'];
+      bgmVibe: HighlightRecord['bgmVibe'];
+      transitionStyle: HighlightRecord['transitionStyle'];
+      cameraEnergy: HighlightRecord['cameraEnergy'];
+      sfxMode: HighlightRecord['sfxMode'];
+      hookSfx: HighlightRecord['hookSfx'];
+      thumbnailPath: string | null;
+      thumbnailUrl: string | null;
+      thumbnailText: string;
+      thumbnailEmojis: string[];
+      thumbnailStyle: ThumbnailVibeStyle;
+      thumbnailTimestamp: number;
     }>
   ): HighlightRecord | null {
     const existing = this.getHighlightInternal(id);
@@ -473,13 +658,20 @@ export const store = {
     const startTime = patch.startTime ?? existing.startTime;
     const endTime = patch.endTime ?? existing.endTime;
     const duration = patch.duration ?? Math.max(1, Number((endTime - startTime).toFixed(2)));
+    const nextEditSegments =
+      patch.editSegments !== undefined ? patch.editSegments : existing.editSegments;
+    const nextThumbEmojis =
+      patch.thumbnailEmojis !== undefined ? patch.thumbnailEmojis : existing.thumbnailEmojis;
 
     db.prepare(
       `UPDATE highlights SET
         start_time = ?, end_time = ?, duration = ?, title = ?, hook_headline = ?, description = ?,
         status = ?, editing_profile = ?, subtitle_style = ?, highlight_color = ?,
         crop_mode = ?, dynamic_zoom = ?, normalize_audio = ?, watermark_enabled = ?,
-        rendered_video_path = ?, rendered_video_url = ?, qc_report_json = ?, updated_at = ?
+        rendered_video_path = ?, rendered_video_url = ?, qc_report_json = ?, edit_segments_json = ?,
+        bgm_vibe = ?, transition_style = ?, camera_energy = ?, sfx_mode = ?, hook_sfx = ?,
+        thumbnail_path = ?, thumbnail_url = ?, thumbnail_text = ?, thumbnail_emojis_json = ?,
+        thumbnail_style = ?, thumbnail_timestamp = ?, updated_at = ?
       WHERE id = ?`
     ).run(
       startTime,
@@ -505,13 +697,27 @@ export const store = {
         : existing.qcReport
         ? JSON.stringify(existing.qcReport)
         : null,
+      nextEditSegments && nextEditSegments.length > 0 ? JSON.stringify(nextEditSegments) : null,
+      patch.bgmVibe ?? existing.bgmVibe ?? 'auto',
+      patch.transitionStyle ?? existing.transitionStyle ?? 'auto',
+      patch.cameraEnergy ?? existing.cameraEnergy ?? 'auto',
+      patch.sfxMode ?? existing.sfxMode ?? 'auto',
+      patch.hookSfx ?? existing.hookSfx ?? 'auto',
+      patch.thumbnailPath !== undefined ? patch.thumbnailPath : existing.thumbnailPath,
+      patch.thumbnailUrl !== undefined ? patch.thumbnailUrl : existing.thumbnailUrl ?? null,
+      patch.thumbnailText !== undefined ? patch.thumbnailText : existing.thumbnailText ?? null,
+      nextThumbEmojis && nextThumbEmojis.length > 0 ? JSON.stringify(nextThumbEmojis) : null,
+      patch.thumbnailStyle ?? existing.thumbnailStyle ?? 'auto',
+      patch.thumbnailTimestamp !== undefined
+        ? patch.thumbnailTimestamp
+        : existing.thumbnailTimestamp ?? null,
       new Date().toISOString(),
       id
     );
 
     const updated = this.getHighlightInternal(id);
     if (!updated) return null;
-    const { renderedVideoPath: _rvp, ...pub } = updated;
+    const { renderedVideoPath: _rvp, thumbnailPath: _tp, ...pub } = updated;
     return pub;
   },
 
@@ -519,9 +725,9 @@ export const store = {
     db.prepare(
       `INSERT INTO exports (
         id, project_id, project_title, highlight_id, clip_title, category_id, category_name,
-        editing_profile, video_path, video_url, metadata_json_path, metadata_json_url,
+        editing_profile, video_path, video_url, thumbnail_url, metadata_json_path, metadata_json_url,
         output_dir, resolution, duration, file_size, platforms_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       params.id,
       params.projectId,
@@ -533,6 +739,7 @@ export const store = {
       params.editingProfile,
       params.videoPath,
       params.videoUrl,
+      params.thumbnailUrl ?? null,
       params.metadataJsonPath,
       params.metadataJsonUrl,
       params.outputDir,

@@ -4,6 +4,7 @@ import { store } from '../db';
 import { formatGeminiError, isTransientGeminiError } from '../geminiClient';
 import { analyzeVideoContent } from './contentUnderstandingAgent';
 import { generateAndScoreHighlights } from './highlightAgent';
+import { generateProjectHighlightThumbnails } from './thumbnailAgent';
 import { transcribeProjectAudio } from './transcriptionAgent';
 import {
   extractAudioTrack,
@@ -42,22 +43,22 @@ async function withPipelineAutoRetry<T>(
       );
       
       console.log(
-        `[Pipeline] ${label} attempt ${attempt + 1}/${MAX_PIPELINE_RETRIES + 1} failed with transient error. Retrying in ${waitMs}ms...`
+        `[Pipeline] ${label} attempt ${attempt + 1}/${MAX_PIPELINE_RETRIES + 1} interrupted by temporary spike; auto-retrying in ${waitMs}ms...`
       );
-      
+
       store.updateProjectStage(
         projectId,
         'transcribing',
         0,
-        `Gemini API temporarily unavailable. Auto-retrying in ${Math.round(waitMs / 1000)}s (attempt ${attempt + 2}/${MAX_PIPELINE_RETRIES + 1})...`,
+        `Gemini API temporarily busy. Auto-retrying in ${Math.round(waitMs / 1000)}s (attempt ${attempt + 2}/${MAX_PIPELINE_RETRIES + 1})...`,
         'processing',
         null
       );
-      
+
       await new Promise((resolve) => setTimeout(resolve, waitMs));
     }
   }
-  
+
   throw lastError;
 }
 
@@ -82,8 +83,8 @@ export async function runYouTubePipeline(params: {
     hasCustomTitle,
   } = params;
 
-  await withPipelineAutoRetry(async () => {
-    try {
+  try {
+    await withPipelineAutoRetry(async () => {
       store.updateProjectStage(
         projectId,
         'downloading',
@@ -167,6 +168,7 @@ export async function runYouTubePipeline(params: {
       const analysis = await analyzeVideoContent({
         projectId,
         title: project.title,
+        brief: project.brief,
         metadata: fallbackMetadata,
         transcript: ytTranscript.segments,
         scenes,
@@ -185,6 +187,7 @@ export async function runYouTubePipeline(params: {
       const highlights = await generateAndScoreHighlights({
         projectId,
         title: project.title,
+        brief: project.brief,
         metadata: fallbackMetadata,
         transcript: ytTranscript.segments,
         analysis,
@@ -195,29 +198,242 @@ export async function runYouTubePipeline(params: {
 
       store.updateProjectStage(
         projectId,
+        'extracting_highlights',
+        95,
+        `Designing vibe-matched cover thumbnails for ${highlights.length} highlights...`
+      );
+      await generateProjectHighlightThumbnails({
+        projectId,
+        highlights,
+        scenes,
+        projectBrief: project.brief,
+        durationFallback: fallbackMetadata.duration,
+        onEachComplete: (hlId, res) => {
+          store.updateHighlight(hlId, {
+            thumbnailPath: res.thumbnailPath,
+            thumbnailUrl: res.thumbnailUrl,
+            thumbnailText: res.thumbnailText,
+            thumbnailEmojis: res.thumbnailEmojis,
+            thumbnailStyle: res.thumbnailStyle,
+            thumbnailTimestamp: res.thumbnailTimestamp,
+          });
+        },
+      });
+
+      store.updateProjectStage(
+        projectId,
         'completed',
         100,
-        `Analyzed via YouTube URL (${highlights.length} highlights). Attach local MP4 or retry with YouTube cookies in Editor to render 1080×1920 exports.`,
+        `Analyzed via YouTube URL (${highlights.length} highlights with cover thumbnails). Attach local MP4 or retry with YouTube cookies in Editor to render 1080×1920 exports.`,
         'ready',
         null
       );
-    } catch (err) {
-      const message = formatGeminiError(err) || 'YouTube import failed.';
-      store.updateProjectStage(projectId, 'failed', 0, message, 'error', message);
-      throw err; // Re-throw to trigger auto-retry
-    }
-  }, projectId, 'YouTube pipeline');
+    }, projectId, 'YouTube pipeline');
+  } catch (err) {
+    const message = formatGeminiError(err) || 'YouTube import failed.';
+    store.updateProjectStage(projectId, 'failed', 0, message, 'error', message);
+  }
 }
 
 export async function runProjectPipeline(projectId: string): Promise<void> {
-  const project = store.getProjectInternal(projectId);
-  if (!project) return;
+  if (!store.getProjectInternal(projectId)) return;
 
   const settings = store.getSettings();
 
-  await withPipelineAutoRetry(async () => {
-    try {
-      // Stage 1: Video Ingestion (FFprobe + Audio extraction + Scene keyframes)
+  try {
+    await withPipelineAutoRetry(async () => {
+      const project = store.getProjectInternal(projectId);
+      if (!project) return;
+      // Multi-Source Mix-and-Match Remix Pipeline
+      if (project.sources && project.sources.length > 1) {
+        const updatedSources = project.sources.map((s) => ({ ...s }));
+        const totalSources = updatedSources.length;
+
+        // Stage 1: Per-source ingestion
+        const allIngested = updatedSources.every(
+          (s) =>
+            Boolean(s.metadata) &&
+            (!s.metadata?.hasAudio || (Boolean(s.audioPath) && fs.existsSync(s.audioPath!))) &&
+            (s.scenes?.length ?? 0) > 0
+        );
+
+        if (!allIngested) {
+          for (let i = 0; i < totalSources; i++) {
+            const src = updatedSources[i];
+            if (
+              src.metadata &&
+              (!src.metadata.hasAudio || (src.audioPath && fs.existsSync(src.audioPath))) &&
+              (src.scenes?.length ?? 0) > 0
+            ) {
+              continue;
+            }
+            if (!src.sourcePath || !fs.existsSync(src.sourcePath)) {
+              throw new Error(`Missing source video file for Clip #${src.index + 1} (${src.filename}).`);
+            }
+            store.updateProjectStage(
+              projectId,
+              'ingesting',
+              Math.round(10 + ((i + 0.3) / totalSources) * 25),
+              `Ingesting source clip ${i + 1}/${totalSources}: ${src.filename}...`
+            );
+            const srcMeta = await probeVideoMetadata(src.sourcePath);
+            const srcAudio = srcMeta.hasAudio
+              ? await extractAudioTrack(src.sourcePath, projectId, src.index)
+              : null;
+            const srcScenes = await extractSceneKeyframes(
+              src.sourcePath,
+              projectId,
+              srcMeta.duration,
+              src.index,
+              src.filename
+            );
+            updatedSources[i] = {
+              ...src,
+              metadata: srcMeta,
+              audioPath: srcAudio,
+              scenes: srcScenes,
+            };
+          }
+        } else {
+          store.updateProjectStage(
+            projectId,
+            'ingesting',
+            35,
+            `Resuming from saved metadata & keyframes across ${totalSources} source clips...`
+          );
+        }
+
+        const primaryMeta = updatedSources[0].metadata!;
+        const mergedMetadata: VideoMetadata = {
+          duration: Number(
+            updatedSources.reduce((acc, s) => acc + (s.metadata?.duration ?? 0), 0).toFixed(2)
+          ),
+          width: primaryMeta.width,
+          height: primaryMeta.height,
+          fps: primaryMeta.fps,
+          videoCodec: primaryMeta.videoCodec,
+          audioCodec: primaryMeta.audioCodec,
+          bitrate: primaryMeta.bitrate,
+          fileSize: updatedSources.reduce((acc, s) => acc + (s.metadata?.fileSize ?? 0), 0),
+          formatName: primaryMeta.formatName,
+          hasAudio: updatedSources.some((s) => Boolean(s.metadata?.hasAudio)),
+        };
+        const mergedScenes = updatedSources.flatMap((s) => s.scenes ?? []);
+        store.saveMultiSourceIngestion(projectId, updatedSources, mergedMetadata, mergedScenes);
+
+        // Stage 2: Per-source transcription with checkpoint persistence
+        for (let i = 0; i < totalSources; i++) {
+          const src = updatedSources[i];
+          if (src.transcript && src.transcript.length > 0) {
+            continue;
+          }
+          if (!src.audioPath || !fs.existsSync(src.audioPath)) {
+            updatedSources[i] = { ...src, transcript: [] };
+            continue;
+          }
+          store.updateProjectStage(
+            projectId,
+            'transcribing',
+            Math.round(38 + (i / totalSources) * 26),
+            `Transcribing clip ${i + 1}/${totalSources} (${src.filename})...`
+          );
+          const transcribed = await transcribeProjectAudio({
+            projectId,
+            audioPath: src.audioPath,
+            duration: src.metadata?.duration ?? 30,
+            languageHint: settings.defaultLanguageHint,
+            sourceIndex: src.index,
+            sourceFilename: src.filename,
+          });
+          updatedSources[i] = { ...src, transcript: transcribed.segments };
+          const partialMerged = updatedSources.flatMap((s) => s.transcript ?? []);
+          store.saveMultiSourceTranscript(projectId, updatedSources, partialMerged);
+        }
+
+        const mergedTranscript = updatedSources.flatMap((s) => s.transcript ?? []);
+        store.saveMultiSourceTranscript(projectId, updatedSources, mergedTranscript);
+
+        // Stage 3: Multi-clip Content Understanding
+        let analysis = project.analysis;
+        if (!analysis) {
+          store.updateProjectStage(
+            projectId,
+            'analyzing',
+            70,
+            `Analyzing all ${totalSources} clips & campaign consigne...`
+          );
+          analysis = await analyzeVideoContent({
+            projectId,
+            title: project.title,
+            brief: project.brief,
+            metadata: mergedMetadata,
+            transcript: mergedTranscript,
+            scenes: mergedScenes,
+            customCategories: settings.customCategories,
+            sources: updatedSources,
+          });
+          store.saveAnalysis(projectId, analysis);
+        }
+
+        // Stage 4: Mix-and-Match Remix Director
+        store.updateProjectStage(
+          projectId,
+          'extracting_highlights',
+          88,
+          `Composing mix-and-match viral edits across ${totalSources} clips...`
+        );
+
+        const highlights = await generateAndScoreHighlights({
+          projectId,
+          title: project.title,
+          brief: project.brief,
+          metadata: mergedMetadata,
+          transcript: mergedTranscript,
+          analysis,
+          settings,
+          sources: updatedSources,
+          scenes: mergedScenes,
+        });
+
+        store.replaceProjectHighlights(projectId, highlights);
+
+        store.updateProjectStage(
+          projectId,
+          'extracting_highlights',
+          95,
+          `Designing vibe-matched cover thumbnails for ${highlights.length} remix videos...`
+        );
+        await generateProjectHighlightThumbnails({
+          projectId,
+          highlights,
+          sources: updatedSources,
+          scenes: mergedScenes,
+          projectBrief: project.brief,
+          durationFallback: mergedMetadata.duration,
+          onEachComplete: (hlId, res) => {
+            store.updateHighlight(hlId, {
+              thumbnailPath: res.thumbnailPath,
+              thumbnailUrl: res.thumbnailUrl,
+              thumbnailText: res.thumbnailText,
+              thumbnailEmojis: res.thumbnailEmojis,
+              thumbnailStyle: res.thumbnailStyle,
+              thumbnailTimestamp: res.thumbnailTimestamp,
+            });
+          },
+        });
+
+        store.updateProjectStage(
+          projectId,
+          'completed',
+          100,
+          `Multi-clip remix ready: ${highlights.length} viral mix-and-match videos & thumbnails composed from ${totalSources} sources.`,
+          'ready',
+          null
+        );
+        return;
+      }
+
+      // Stage 1: Single-Video Ingestion (FFprobe + Audio extraction + Scene keyframes)
       const hasCachedIngestion =
         Boolean(project.metadata) &&
         (!project.metadata?.hasAudio || (Boolean(project.audioPath) && fs.existsSync(project.audioPath!))) &&
@@ -314,6 +530,7 @@ export async function runProjectPipeline(projectId: string): Promise<void> {
         analysis = await analyzeVideoContent({
           projectId,
           title: project.title,
+          brief: project.brief,
           metadata,
           transcript: segments,
           scenes,
@@ -334,6 +551,7 @@ export async function runProjectPipeline(projectId: string): Promise<void> {
       const highlights = await generateAndScoreHighlights({
         projectId,
         title: project.title,
+        brief: project.brief,
         metadata,
         transcript: segments,
         analysis,
@@ -345,16 +563,40 @@ export async function runProjectPipeline(projectId: string): Promise<void> {
 
       store.updateProjectStage(
         projectId,
+        'extracting_highlights',
+        95,
+        `Designing vibe-matched cover thumbnails for ${highlights.length} highlights...`
+      );
+      await generateProjectHighlightThumbnails({
+        projectId,
+        highlights,
+        sourcePath: project.sourcePath,
+        scenes,
+        projectBrief: project.brief,
+        durationFallback: metadata.duration,
+        onEachComplete: (hlId, res) => {
+          store.updateHighlight(hlId, {
+            thumbnailPath: res.thumbnailPath,
+            thumbnailUrl: res.thumbnailUrl,
+            thumbnailText: res.thumbnailText,
+            thumbnailEmojis: res.thumbnailEmojis,
+            thumbnailStyle: res.thumbnailStyle,
+            thumbnailTimestamp: res.thumbnailTimestamp,
+          });
+        },
+      });
+
+      store.updateProjectStage(
+        projectId,
         'completed',
         100,
-        `Pipeline complete: ${highlights.length} highlight candidates scored.`,
+        `Pipeline complete: ${highlights.length} highlight candidates & cover thumbnails ready.`,
         'ready',
         null
       );
-    } catch (err) {
-      const message = formatGeminiError(err) || 'Pipeline execution failed.';
-      store.updateProjectStage(projectId, 'failed', 0, message, 'error', message);
-      throw err; // Re-throw to trigger auto-retry
-    }
-  }, projectId, 'Project pipeline');
+    }, projectId, 'Project pipeline');
+  } catch (err) {
+    const message = formatGeminiError(err) || 'Pipeline execution failed.';
+    store.updateProjectStage(projectId, 'failed', 0, message, 'error', message);
+  }
 }

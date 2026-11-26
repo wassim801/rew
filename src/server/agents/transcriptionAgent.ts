@@ -80,7 +80,7 @@ export async function detectSpeechIntervals(
         '-i',
         audioPath,
         '-af',
-        'silencedetect=noise=-34dB:d=0.28',
+        'silencedetect=noise=-36dB:d=0.24',
         '-f',
         'null',
         '-',
@@ -312,14 +312,27 @@ export async function alignClipSubtitlesWithAudio(params: {
   endTime: number;
   fallbackTranscript: TranscriptSegment[];
   languageHint?: string;
+  overrideCacheKey?: string;
 }): Promise<AlignedSubtitleCue[]> {
-  const { projectId, sourcePath, highlightId, startTime, endTime, fallbackTranscript, languageHint } = params;
+  const {
+    projectId,
+    sourcePath,
+    highlightId,
+    startTime,
+    endTime,
+    fallbackTranscript,
+    languageHint,
+    overrideCacheKey,
+  } = params;
   const clipDur = Math.max(1, Number((endTime - startTime).toFixed(2)));
   const projectDir = resolveSafePath(PROJECTS_DIR, projectId);
   const rendersDir = resolveSafePath(projectDir, 'renders');
   fs.mkdirSync(rendersDir, { recursive: true });
 
-  const cacheFilename = `subalign_${highlightId}_${startTime.toFixed(2)}_${endTime.toFixed(2)}.json`;
+  const safeKey = overrideCacheKey
+    ? overrideCacheKey.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80)
+    : `${highlightId}_${startTime.toFixed(2)}_${endTime.toFixed(2)}`;
+  const cacheFilename = `subalign_${safeKey}.json`;
   const cachePath = resolveSafePath(rendersDir, cacheFilename);
 
   if (fs.existsSync(cachePath)) {
@@ -340,35 +353,48 @@ export async function alignClipSubtitlesWithAudio(params: {
 
   const tmpClipAudio = resolveSafePath(rendersDir, `subalign_tmp_${highlightId}_${Date.now()}.mp3`);
   try {
-    const preSeek = Math.max(0, Number((startTime - 4).toFixed(3)));
-    const fineSeek = Number((startTime - preSeek).toFixed(3));
+    const ffArgs =
+      startTime <= 0.05
+        ? [
+            '-y',
+            '-nostats',
+            '-loglevel',
+            'error',
+            '-i',
+            sourcePath,
+            '-t',
+            String(clipDur),
+            '-vn',
+            '-ac',
+            '1',
+            '-ar',
+            '16000',
+            '-b:a',
+            '64k',
+            tmpClipAudio,
+          ]
+        : [
+            '-y',
+            '-nostats',
+            '-loglevel',
+            'error',
+            '-ss',
+            String(startTime),
+            '-t',
+            String(clipDur),
+            '-i',
+            sourcePath,
+            '-vn',
+            '-ac',
+            '1',
+            '-ar',
+            '16000',
+            '-b:a',
+            '64k',
+            tmpClipAudio,
+          ];
 
-    await execFileAsync(
-      'ffmpeg',
-      [
-        '-y',
-        '-nostats',
-        '-loglevel',
-        'error',
-        '-ss',
-        String(preSeek),
-        '-i',
-        sourcePath,
-        '-ss',
-        String(fineSeek),
-        '-t',
-        String(clipDur),
-        '-vn',
-        '-ac',
-        '1',
-        '-ar',
-        '16000',
-        '-b:a',
-        '64k',
-        tmpClipAudio,
-      ],
-      { maxBuffer: 10 * 1024 * 1024 }
-    );
+    await execFileAsync('ffmpeg', ffArgs, { maxBuffer: 10 * 1024 * 1024 });
 
     if (fs.existsSync(tmpClipAudio) && fs.statSync(tmpClipAudio).size > 256) {
       const speechIntervals = await detectSpeechIntervals(tmpClipAudio, clipDur);
@@ -498,8 +524,18 @@ export async function transcribeProjectAudio(params: {
   duration: number;
   languageHint?: 'auto' | 'en' | 'fr' | 'ar';
   onChunkProgress?: (completed: number, total: number) => void;
+  sourceIndex?: number;
+  sourceFilename?: string;
 }): Promise<{ segments: TranscriptSegment[]; detectedLanguage: string }> {
-  const { projectId, audioPath, duration, languageHint = 'auto', onChunkProgress } = params;
+  const {
+    projectId,
+    audioPath,
+    duration,
+    languageHint = 'auto',
+    onChunkProgress,
+    sourceIndex,
+    sourceFilename,
+  } = params;
 
   if (!audioPath || !fs.existsSync(audioPath)) {
     throw new Error('No audio track available for transcription.');
@@ -513,7 +549,10 @@ export async function transcribeProjectAudio(params: {
   const mergedRaw: Array<{ start: number; end: number; speaker: string; text: string }> = [];
 
   const projectDir = resolveSafePath(PROJECTS_DIR, projectId);
-  const chunkCacheDir = resolveSafePath(projectDir, 'transcript_chunks');
+  const chunkCacheDir = resolveSafePath(
+    projectDir,
+    sourceIndex !== undefined ? `transcript_chunks_src_${sourceIndex}` : 'transcript_chunks'
+  );
 
   if (fileSizeMb <= 10 && duration <= 180) {
     const speechIntervals = await detectSpeechIntervals(audioPath, duration);
@@ -656,19 +695,23 @@ export async function transcribeProjectAudio(params: {
       const start = Math.max(0, Math.min(duration, Number(s.start) || 0));
       const end = Math.max(start + 0.5, Math.min(duration, Number(s.end) || start + 2));
       return {
-        id: `seg_${idx + 1}`,
+        id: sourceIndex !== undefined ? `src${sourceIndex}_seg_${idx + 1}` : `seg_${idx + 1}`,
         start: Number(start.toFixed(2)),
         end: Number(end.toFixed(2)),
         speaker: (s.speaker || 'Speaker 1').trim(),
         text: s.text.trim(),
         language: languageCode,
+        ...(sourceIndex !== undefined ? { sourceIndex } : {}),
+        ...(sourceFilename ? { sourceFilename } : {}),
       };
     });
 
-  // Save transcript locally as JSON artifact per project
+  // Save transcript locally as JSON artifact per project (or per source clip)
   fs.mkdirSync(projectDir, { recursive: true });
+  const transcriptFilename =
+    sourceIndex !== undefined ? `transcript_src_${sourceIndex}.json` : 'transcript.json';
   fs.writeFileSync(
-    resolveSafePath(projectDir, 'transcript.json'),
+    resolveSafePath(projectDir, transcriptFilename),
     JSON.stringify(
       {
         detectedLanguage,

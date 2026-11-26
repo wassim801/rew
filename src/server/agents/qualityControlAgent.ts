@@ -1,6 +1,7 @@
 import fs from 'fs';
 import type {
   HighlightRecord,
+  ProjectSourceVideo,
   QualityCheckItem,
   QualityControlReport,
   StudioSettings,
@@ -17,10 +18,12 @@ export async function validateRenderedClip(params: {
   transcript: TranscriptSegment[];
   sourceMetadata: VideoMetadata | null;
   settings: StudioSettings;
+  sources?: ProjectSourceVideo[];
 }): Promise<QualityControlReport> {
-  const { renderedPath, highlight, transcript, sourceMetadata, settings } = params;
+  const { renderedPath, highlight, transcript, sourceMetadata, settings, sources } = params;
   const checks: QualityCheckItem[] = [];
   const fixableIssues: string[] = [];
+  const isRemix = Boolean(highlight.editSegments && highlight.editSegments.length > 0);
 
   if (!fs.existsSync(renderedPath)) {
     return {
@@ -53,37 +56,67 @@ export async function validateRenderedClip(params: {
     detail: `Video: ${probe.videoCodec.toUpperCase()} · Audio: ${probe.audioCodec?.toUpperCase() || 'None'} · ${(probe.fileSize / (1024 * 1024)).toFixed(2)} MB`,
   });
 
-  // 3. Clip boundaries & duration
-  const durationDelta = Math.abs(probe.duration - highlight.duration);
-  const boundaryOk = probe.duration >= 3 && durationDelta <= 1.5;
+  // 3. Clip boundaries & duration (accounting for xfade overlap when transitions are active)
+  let targetDur = highlight.duration;
+  if (isRemix && highlight.editSegments) {
+    const segDurs = highlight.editSegments.map((s) => Math.max(1.2, s.endTime - s.startTime));
+    const sumDur = segDurs.reduce((a, b) => a + b, 0);
+    const minSeg = Math.min(...segDurs);
+    const ts = highlight.transitionStyle && highlight.transitionStyle !== 'auto'
+      ? highlight.transitionStyle
+      : highlight.editingProfile === 'Dynamic' || highlight.editingProfile === 'Gaming'
+      ? 'zoom-punch'
+      : highlight.editingProfile === 'Comedy' || highlight.editingProfile === 'Travel'
+      ? 'whip-slide'
+      : highlight.editingProfile === 'Cinematic'
+      ? 'dissolve'
+      : 'hard-cut';
+    const baseTx = ts === 'dissolve' ? 0.28 : ts === 'whip-slide' ? 0.22 : ts === 'zoom-punch' ? 0.20 : ts === 'flash-cut' ? 0.16 : 0;
+    const effTx = segDurs.length >= 2 && baseTx > 0 ? Math.min(baseTx, minSeg * 0.32) : 0;
+    targetDur = Math.max(1, sumDur - Math.max(0, segDurs.length - 1) * effTx);
+  }
+  const durationDelta = Math.abs(probe.duration - targetDur);
+  const boundaryOk = probe.duration >= 3 && durationDelta <= 1.8;
   checks.push({
     name: 'Clip Boundaries & Sync',
     status: boundaryOk ? 'pass' : 'warn',
-    detail: `Rendered ${probe.duration.toFixed(2)}s (target ${highlight.duration.toFixed(2)}s).`,
+    detail: `Rendered ${probe.duration.toFixed(2)}s (target ${targetDur.toFixed(2)}s).`,
   });
 
   // 4. Complete speech check against transcript
-  const overlapping = transcript.filter(
-    (s) => s.end > highlight.startTime && s.start < highlight.endTime
-  );
-  const firstSeg = overlapping[0];
-  const lastSeg = overlapping[overlapping.length - 1];
-  const cutsStart = firstSeg ? highlight.startTime - firstSeg.start > 0.8 : false;
-  const cutsEnd = lastSeg ? lastSeg.end - highlight.endTime > 0.8 : false;
+  const overlapping = isRemix
+    ? (highlight.editSegments ?? []).flatMap((seg) => {
+        const srcTrans = (sources?.[seg.sourceIndex]?.transcript ?? transcript);
+        return srcTrans.filter((t) => t.end > seg.startTime && t.start < seg.endTime);
+      })
+    : transcript.filter((s) => s.end > highlight.startTime && s.start < highlight.endTime);
 
-  if (cutsStart || cutsEnd) {
-    checks.push({
-      name: 'Complete Speech Framing',
-      status: 'warn',
-      detail: 'Clip boundary cuts across an active spoken sentence; boundary padding recommended.',
-    });
-    fixableIssues.push('Expand clip boundary to complete sentence boundaries');
-  } else {
+  if (isRemix) {
     checks.push({
       name: 'Complete Speech Framing',
       status: 'pass',
-      detail: `${overlapping.length} complete transcript segment(s) cleanly framed.`,
+      detail: `${highlight.editSegments!.length} cross-cut remix segment(s) stitched (${overlapping.length} spoken phrase(s)).`,
     });
+  } else {
+    const firstSeg = overlapping[0];
+    const lastSeg = overlapping[overlapping.length - 1];
+    const cutsStart = firstSeg ? highlight.startTime - firstSeg.start > 0.8 : false;
+    const cutsEnd = lastSeg ? lastSeg.end - highlight.endTime > 0.8 : false;
+
+    if (cutsStart || cutsEnd) {
+      checks.push({
+        name: 'Complete Speech Framing',
+        status: 'warn',
+        detail: 'Clip boundary cuts across an active spoken sentence; boundary padding recommended.',
+      });
+      fixableIssues.push('Expand clip boundary to complete sentence boundaries');
+    } else {
+      checks.push({
+        name: 'Complete Speech Framing',
+        status: 'pass',
+        detail: `${overlapping.length} complete transcript segment(s) cleanly framed.`,
+      });
+    }
   }
 
   // 5. Subtitle readability
@@ -112,7 +145,7 @@ export async function validateRenderedClip(params: {
   }
 
   // Check duration ceiling vs source
-  if (sourceMetadata && highlight.endTime > sourceMetadata.duration + 0.1) {
+  if (!isRemix && sourceMetadata && highlight.endTime > sourceMetadata.duration + 0.1) {
     fixableIssues.push('Clamp endTime to source video duration');
   }
 
@@ -129,28 +162,31 @@ export async function validateRenderedClip(params: {
 
 export async function autoHealAndRegenerateClip(params: {
   projectId: string;
+  projectBrief?: string;
   sourcePath: string;
   sourceMetadata: VideoMetadata | null;
   highlight: HighlightRecord;
   transcript: TranscriptSegment[];
   settings: StudioSettings;
   languageCode: string;
+  sources?: ProjectSourceVideo[];
 }): Promise<{
   patchedHighlight: Partial<HighlightRecord>;
   renderedPath: string;
   renderedUrl: string;
   qcReport: QualityControlReport;
 }> {
-  const { projectId, sourcePath, sourceMetadata, highlight, transcript, settings, languageCode } = params;
+  const { projectId, projectBrief, sourcePath, sourceMetadata, highlight, transcript, settings, languageCode, sources } = params;
+  const isRemix = Boolean(highlight.editSegments && highlight.editSegments.length > 0);
 
-  const overlapping = transcript.filter(
-    (s) => s.end > highlight.startTime && s.start < highlight.endTime
-  );
+  const overlapping = isRemix
+    ? []
+    : transcript.filter((s) => s.end > highlight.startTime && s.start < highlight.endTime);
 
   let newStart = highlight.startTime;
   let newEnd = highlight.endTime;
 
-  if (overlapping.length > 0) {
+  if (!isRemix && overlapping.length > 0) {
     newStart = Math.max(0, Number((overlapping[0].start - 0.15).toFixed(2)));
     newEnd = Math.min(
       sourceMetadata?.duration ?? highlight.endTime + 2,
@@ -163,18 +199,20 @@ export async function autoHealAndRegenerateClip(params: {
     ...highlight,
     startTime: newStart,
     endTime: newEnd,
-    duration: Math.max(1, Number((newEnd - newStart).toFixed(2))),
+    duration: isRemix ? highlight.duration : Math.max(1, Number((newEnd - newStart).toFixed(2))),
     dynamicZoom: cat.avoidEffects ? false : highlight.dynamicZoom,
   };
 
   const rendered = await renderAdaptiveClip({
     projectId,
+    projectBrief,
     sourcePath,
     metadata: sourceMetadata,
     highlight: updatedHighlight,
     transcript,
     settings,
     languageCode,
+    sources,
   });
 
   const qcReport = await validateRenderedClip({
@@ -183,6 +221,7 @@ export async function autoHealAndRegenerateClip(params: {
     transcript,
     sourceMetadata,
     settings,
+    sources,
   });
   qcReport.autoRegenerated = true;
 

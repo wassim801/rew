@@ -70,11 +70,14 @@ export async function probeVideoMetadata(filePath: string): Promise<VideoMetadat
 
 export async function extractAudioTrack(
   videoPath: string,
-  projectId: string
+  projectId: string,
+  sourceIndex?: number
 ): Promise<string | null> {
   const projectDir = resolveSafePath(PROJECTS_DIR, projectId);
   fs.mkdirSync(projectDir, { recursive: true });
-  const audioPath = resolveSafePath(projectDir, 'audio.mp3');
+  const audioFilename =
+    sourceIndex !== undefined ? `audio_src_${sourceIndex}.mp3` : 'audio.mp3';
+  const audioPath = resolveSafePath(projectDir, audioFilename);
 
   try {
     await execFileAsync(
@@ -106,19 +109,25 @@ export async function extractAudioTrack(
 export async function extractSceneKeyframes(
   videoPath: string,
   projectId: string,
-  duration: number
+  duration: number,
+  sourceIndex?: number,
+  sourceFilename?: string
 ): Promise<SceneKeyframe[]> {
   const projectDir = resolveSafePath(PROJECTS_DIR, projectId);
   const scenesDir = resolveSafePath(projectDir, 'scenes');
   fs.mkdirSync(scenesDir, { recursive: true });
 
-  const sampleCount = Math.min(6, Math.max(3, Math.floor(duration / 12) || 3));
+  const sampleCount =
+    sourceIndex !== undefined
+      ? Math.min(4, Math.max(2, Math.floor(duration / 15) || 2))
+      : Math.min(6, Math.max(3, Math.floor(duration / 12) || 3));
   const keyframes: SceneKeyframe[] = [];
 
   for (let i = 0; i < sampleCount; i++) {
     const ratio = (i + 0.5) / sampleCount;
     const ts = Number(Math.max(0.2, Math.min(duration - 0.2, duration * ratio)).toFixed(2));
-    const frameName = `scene_${String(i + 1).padStart(2, '0')}.jpg`;
+    const prefix = sourceIndex !== undefined ? `src_${sourceIndex}_` : '';
+    const frameName = `${prefix}scene_${String(i + 1).padStart(2, '0')}.jpg`;
     const framePath = resolveSafePath(scenesDir, frameName);
 
     try {
@@ -149,6 +158,8 @@ export async function extractSceneKeyframes(
           timestamp: ts,
           thumbnailUrl: `/api/projects/${encodeURIComponent(projectId)}/scenes/${frameName}`,
           sceneScore: Number((0.72 + (i % 3) * 0.08).toFixed(2)),
+          ...(sourceIndex !== undefined ? { sourceIndex } : {}),
+          ...(sourceFilename ? { sourceFilename } : {}),
         });
       }
     } catch {

@@ -16,7 +16,8 @@ interface ContentAnalysisPageProps {
   onOverrideAnalysis: (
     projectId: string,
     primaryCategoryId: string,
-    recommendedProfile: EditingProfileId
+    recommendedProfile: EditingProfileId,
+    brief?: string
   ) => Promise<void>;
   onReanalyzeHighlights: (projectId: string) => Promise<void>;
   onRetryProject: (projectId: string) => Promise<void>;
@@ -34,6 +35,7 @@ export function ContentAnalysisPage({
 }: ContentAnalysisPageProps) {
   const [selectedCategoryId, setSelectedCategoryId] = useState('');
   const [selectedProfile, setSelectedProfile] = useState<EditingProfileId>('Minimal');
+  const [editedBrief, setEditedBrief] = useState('');
   const [saving, setSaving] = useState(false);
   const [rescoring, setRescoring] = useState(false);
 
@@ -42,7 +44,13 @@ export function ContentAnalysisPage({
       setSelectedCategoryId(project.analysis.primaryCategoryId);
       setSelectedProfile(project.analysis.recommendedProfile);
     }
-  }, [project?.id, project?.analysis?.primaryCategoryId, project?.analysis?.recommendedProfile]);
+    setEditedBrief(project?.brief ?? '');
+  }, [
+    project?.id,
+    project?.brief,
+    project?.analysis?.primaryCategoryId,
+    project?.analysis?.recommendedProfile,
+  ]);
 
   if (!project) {
     return (
@@ -102,7 +110,7 @@ export function ContentAnalysisPage({
   const handleSaveOverride = async () => {
     setSaving(true);
     try {
-      await onOverrideAnalysis(project.id, selectedCategoryId, selectedProfile);
+      await onOverrideAnalysis(project.id, selectedCategoryId, selectedProfile, editedBrief);
     } finally {
       setSaving(false);
     }
@@ -111,7 +119,7 @@ export function ContentAnalysisPage({
   const handleRescore = async () => {
     setRescoring(true);
     try {
-      await onOverrideAnalysis(project.id, selectedCategoryId, selectedProfile);
+      await onOverrideAnalysis(project.id, selectedCategoryId, selectedProfile, editedBrief);
       await onReanalyzeHighlights(project.id);
       onNavigate('highlights');
     } finally {
@@ -202,6 +210,22 @@ export function ContentAnalysisPage({
           )}
 
           <div className="border-t border-slate-800 pt-4 space-y-2">
+            {(project.brief || analysis.briefInterpretation) && (
+              <div className="rounded-lg border border-blue-500/20 bg-blue-500/5 p-3 space-y-1.5 mb-3">
+                {project.brief && (
+                  <div className="text-xs text-slate-300">
+                    <span className="font-semibold text-blue-300">Your Consigne: </span>
+                    {project.brief}
+                  </div>
+                )}
+                {analysis.briefInterpretation && (
+                  <div className="text-xs text-slate-300">
+                    <span className="font-semibold text-emerald-300">AI Editorial Plan: </span>
+                    {analysis.briefInterpretation}
+                  </div>
+                )}
+              </div>
+            )}
             <div className="text-xs text-slate-400">
               Main Topics: <span className="text-slate-200">{analysis.mainTopics.join(' · ') || 'General'}</span>
             </div>
@@ -252,6 +276,17 @@ export function ContentAnalysisPage({
                   </option>
                 ))}
               </select>
+            </label>
+
+            <label className="block text-xs font-medium text-slate-300">
+              AI Consigne / Creative Brief
+              <textarea
+                rows={3}
+                value={editedBrief}
+                onChange={(e) => setEditedBrief(e.target.value)}
+                placeholder="Instructions for how AI should select highlights and style edits..."
+                className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:border-blue-500 focus:outline-none"
+              />
             </label>
           </div>
 

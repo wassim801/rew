@@ -12,6 +12,39 @@ export type SubtitleStylePreset = 'clean' | 'bold-highlight' | 'karaoke-pop' | '
 
 export type CropFocusMode = 'auto-speaker' | 'center' | 'left-subject' | 'right-subject' | 'fit-blur';
 
+export type BgmVibe = 'auto' | 'none' | 'upbeat-pop' | 'lofi-warm' | 'hype-beat' | 'cinematic-warm';
+
+export type TransitionStyle = 'auto' | 'whip-slide' | 'zoom-punch' | 'dissolve' | 'flash-cut' | 'hard-cut';
+
+export type CameraEnergy = 'auto' | 'calm' | 'dynamic' | 'viral-shake';
+
+export type SfxMode =
+  | 'auto'
+  | 'none'
+  | 'playful-viral'
+  | 'dramatic-impact'
+  | 'smart-ui'
+  | 'subtle-clean';
+
+export type ThumbnailVibeStyle =
+  | 'auto'
+  | 'viral-pop'
+  | 'lifestyle-warm'
+  | 'cinematic-editorial'
+  | 'comedy-sticker'
+  | 'tech-neon'
+  | 'podcast-quote';
+
+export type SfxCueType =
+  | 'mouse-click'
+  | 'clever-ding'
+  | 'shock-boom'
+  | 'buzz-zap'
+  | 'whoosh-swish'
+  | 'pop-bubble'
+  | 'cash-sparkle'
+  | 'riser-hit';
+
 export interface CriteriaWeights {
   hookStrength: number;
   standaloneContext: number;
@@ -65,12 +98,40 @@ export interface TranscriptSegment {
   text: string;
   speaker: string;
   language?: string;
+  sourceIndex?: number;
+  sourceFilename?: string;
 }
 
 export interface SceneKeyframe {
   timestamp: number;
   thumbnailUrl: string;
   sceneScore: number;
+  sourceIndex?: number;
+  sourceFilename?: string;
+}
+
+export interface ProjectSourceVideo {
+  id: string;
+  index: number;
+  filename: string;
+  sourceUrl: string;
+  sourcePath?: string;
+  audioPath?: string | null;
+  metadata?: VideoMetadata | null;
+  transcript?: TranscriptSegment[];
+  scenes?: SceneKeyframe[];
+}
+
+export interface RemixSegment {
+  id: string;
+  sourceIndex: number;
+  sourceFilename: string;
+  startTime: number;
+  endTime: number;
+  role: 'hook' | 'story' | 'product' | 'payoff' | 'cutaway';
+  visualNote?: string;
+  sfxCue?: SfxCueType | 'none';
+  isThumbnailFrame?: boolean;
 }
 
 export interface CategoryScore {
@@ -94,6 +155,7 @@ export interface ContentAnalysis {
   recommendedProfile: EditingProfileId;
   emotionalArc: string;
   structureNotes: string;
+  briefInterpretation?: string;
   userOverriddenCategory?: boolean;
 }
 
@@ -158,6 +220,17 @@ export interface HighlightRecord {
   watermarkEnabled: boolean;
   renderedVideoUrl: string | null;
   qcReport: QualityControlReport | null;
+  editSegments?: RemixSegment[];
+  bgmVibe?: BgmVibe;
+  transitionStyle?: TransitionStyle;
+  cameraEnergy?: CameraEnergy;
+  sfxMode?: SfxMode;
+  hookSfx?: SfxCueType | 'auto' | 'none';
+  thumbnailText?: string;
+  thumbnailEmojis?: string[];
+  thumbnailStyle?: ThumbnailVibeStyle;
+  thumbnailTimestamp?: number;
+  thumbnailUrl?: string | null;
 }
 
 export interface ExportRecord {
@@ -170,6 +243,7 @@ export interface ExportRecord {
   categoryName: string;
   editingProfile: EditingProfileId;
   videoUrl: string;
+  thumbnailUrl?: string | null;
   metadataJsonUrl: string;
   outputDir: string;
   resolution: string;
@@ -192,6 +266,7 @@ export type PipelineStage =
 export interface ProjectRecord {
   id: string;
   title: string;
+  brief?: string;
   sourceFilename: string;
   sourceUrl: string;
   youtubeVideoId?: string | null;
@@ -205,6 +280,7 @@ export interface ProjectRecord {
   transcript: TranscriptSegment[];
   scenes: SceneKeyframe[];
   analysis: ContentAnalysis | null;
+  sources?: ProjectSourceVideo[];
   createdAt: string;
   updatedAt: string;
 }

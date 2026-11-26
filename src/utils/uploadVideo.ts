@@ -70,15 +70,25 @@ function sendChunkWithXhr(params: {
   });
 }
 
-export async function uploadVideoInChunks(params: {
+export interface StagedUploadFile {
+  filename: string;
+  storedFilename: string;
+  sourceUrl: string;
+}
+
+async function runChunkedUploadCore(params: {
   file: File;
   title?: string;
+  brief?: string;
   attachProjectId?: string;
+  stageOnly?: boolean;
   onProgress?: (percent: number, stats?: UploadProgressStats) => void;
-}): Promise<ProjectRecord> {
-  const { file, title, attachProjectId, onProgress } = params;
+}): Promise<{ project?: ProjectRecord; stagedFile?: StagedUploadFile }> {
+  const { file, title, brief, attachProjectId, stageOnly, onProgress } = params;
   const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE_BYTES));
-  const fingerprint = `${file.name}|${file.size}|${file.lastModified}|${attachProjectId || ''}`;
+  const fingerprint = `${file.name}|${file.size}|${file.lastModified}|${attachProjectId || ''}|${
+    stageOnly ? 'stage' : 'proj'
+  }`;
 
   onProgress?.(0, {
     percent: 0,
@@ -95,11 +105,13 @@ export async function uploadVideoInChunks(params: {
     body: JSON.stringify({
       filename: file.name,
       title: title?.trim() || file.name,
+      brief: brief?.trim() || undefined,
       fileSize: file.size,
       totalChunks,
       chunkSize: CHUNK_SIZE_BYTES,
       fingerprint,
       attachProjectId,
+      stageOnly: Boolean(stageOnly),
     }),
   });
   const initData = await parseJsonSafe(initRes);
@@ -220,7 +232,7 @@ export async function uploadVideoInChunks(params: {
     body: JSON.stringify({ uploadId }),
   });
   const completeData = await parseJsonSafe(completeRes);
-  if (!completeRes.ok || !completeData.project) {
+  if (!completeRes.ok || (!completeData.project && !completeData.stagedFile)) {
     throw new Error(
       (typeof completeData.error === 'string' && completeData.error) ||
         `Failed to finalize uploaded video (HTTP ${completeRes.status})`
@@ -236,5 +248,33 @@ export async function uploadVideoInChunks(params: {
     resumedChunks: alreadyUploaded.size,
   });
 
-  return completeData.project as ProjectRecord;
+  return {
+    project: completeData.project as ProjectRecord | undefined,
+    stagedFile: completeData.stagedFile as StagedUploadFile | undefined,
+  };
+}
+
+export async function uploadVideoInChunks(params: {
+  file: File;
+  title?: string;
+  brief?: string;
+  attachProjectId?: string;
+  onProgress?: (percent: number, stats?: UploadProgressStats) => void;
+}): Promise<ProjectRecord> {
+  const res = await runChunkedUploadCore({ ...params, stageOnly: false });
+  if (!res.project) {
+    throw new Error('Server did not return created project.');
+  }
+  return res.project;
+}
+
+export async function stageVideoInChunks(params: {
+  file: File;
+  onProgress?: (percent: number, stats?: UploadProgressStats) => void;
+}): Promise<StagedUploadFile> {
+  const res = await runChunkedUploadCore({ ...params, stageOnly: true });
+  if (!res.stagedFile) {
+    throw new Error('Server did not return staged upload metadata.');
+  }
+  return res.stagedFile;
 }

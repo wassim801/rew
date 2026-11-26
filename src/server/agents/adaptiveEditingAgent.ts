@@ -1,19 +1,32 @@
 import { execFile } from 'child_process';
+import crypto from 'crypto';
 import fs from 'fs';
+import path from 'path';
 import { promisify } from 'util';
 import type {
+  CameraEnergy,
   EditingProfileId,
   HighlightRecord,
+  ProjectSourceVideo,
   StudioSettings,
   TranscriptSegment,
+  TransitionStyle,
   VideoMetadata,
 } from '../../types/studio';
+import { ensureBgmTrack, resolveHighlightBgmVibe } from '../audio/bgmGenerator';
+import {
+  inferSceneSfxCue,
+  renderCompositeSfxTrack,
+  resolveHighlightSfxMode,
+  type SfxEvent,
+} from '../audio/sfxGenerator';
 import { EDITING_PROFILES } from '../categories';
 import { PROJECTS_DIR, resolveSafePath } from '../db';
 import {
   type AlignedSubtitleCue,
   alignClipSubtitlesWithAudio,
 } from './transcriptionAgent';
+import { probeVideoMetadata } from './videoIngestionAgent';
 
 const execFileAsync = promisify(execFile);
 
@@ -129,7 +142,7 @@ function buildKaraokeWordTags(
   const words = safe.split(' ').filter(Boolean);
   if (words.length === 0) return safe;
 
-  const lowerKeywords = keywords
+  const lowerKeywords = (keywords ?? [])
     .flatMap((k) => k.toLowerCase().split(/\s+/))
     .filter((w) => w.length >= 3);
 
@@ -301,6 +314,66 @@ interface MontageShot {
   end: number;
   zoomExpr: string;
   focusX: number;
+  shakeXExpr: string;
+  shakeYExpr: string;
+  hasShake: boolean;
+}
+
+function resolveEffectiveTransitionStyle(highlight: HighlightRecord): Exclude<TransitionStyle, 'auto'> {
+  if (highlight.transitionStyle && highlight.transitionStyle !== 'auto') {
+    return highlight.transitionStyle;
+  }
+  switch (highlight.editingProfile) {
+    case 'Dynamic':
+    case 'Gaming':
+      return 'zoom-punch';
+    case 'Comedy':
+    case 'Travel':
+      return 'whip-slide';
+    case 'Cinematic':
+      return 'dissolve';
+    case 'Podcast':
+    case 'Minimal':
+    case 'Educational':
+    default:
+      return 'hard-cut';
+  }
+}
+
+function resolveEffectiveCameraEnergy(highlight: HighlightRecord): Exclude<CameraEnergy, 'auto'> {
+  if (highlight.cameraEnergy && highlight.cameraEnergy !== 'auto') {
+    return highlight.cameraEnergy;
+  }
+  if (highlight.editingProfile === 'Minimal' || highlight.editingProfile === 'Educational') {
+    return highlight.dynamicZoom ? 'dynamic' : 'calm';
+  }
+  if (
+    highlight.editingProfile === 'Dynamic' ||
+    highlight.editingProfile === 'Gaming' ||
+    highlight.editingProfile === 'Comedy'
+  ) {
+    return highlight.dynamicZoom ? 'viral-shake' : 'dynamic';
+  }
+  return highlight.dynamicZoom ? 'dynamic' : 'calm';
+}
+
+function getXfadePlan(style: Exclude<TransitionStyle, 'auto'>): {
+  duration: number;
+  transitions: string[];
+} {
+  switch (style) {
+    case 'whip-slide':
+      return { duration: 0.22, transitions: ['smoothleft', 'smoothup', 'smoothright', 'slideleft'] };
+    case 'zoom-punch':
+      return { duration: 0.20, transitions: ['circleopen', 'radial', 'hblur', 'smoothleft'] };
+    case 'dissolve':
+      return { duration: 0.28, transitions: ['dissolve', 'fade', 'fadeblack'] };
+    case 'flash-cut':
+      return { duration: 0.16, transitions: ['fadewhite', 'hblur', 'fadewhite'] };
+    case 'hard-cut':
+    default:
+      return { duration: 0, transitions: [] };
+  }
 }
 
 function buildMontageShotPlan(params: {
@@ -310,16 +383,17 @@ function buildMontageShotPlan(params: {
   profileId: EditingProfileId;
   allowDynamicZoom: boolean;
   isLandscapeSource: boolean;
-}): { shots: MontageShot[]; hasMultiSpeakerSwitching: boolean } {
+}): { shots: MontageShot[]; hasMultiSpeakerSwitching: boolean; anyShake: boolean } {
   const { chunks, clipDuration, highlight, profileId, allowDynamicZoom, isLandscapeSource } = params;
 
-  const isRestrained = profileId === 'Minimal' || profileId === 'Educational';
+  const energy = resolveEffectiveCameraEnergy(highlight);
+  const isRestrained = (profileId === 'Minimal' || profileId === 'Educational') && energy === 'calm';
   const enablePunchCuts =
-    highlight.cropMode !== 'fit-blur' && (!isRestrained || highlight.dynamicZoom);
+    highlight.cropMode !== 'fit-blur' && (!isRestrained || highlight.dynamicZoom || energy !== 'calm');
 
-  // Merge voice chunks into deliberate camera shots (>= 2.5s each, max 10 shots per clip)
+  // Merge voice chunks into deliberate camera shots (>= 2.2s each, max 10 shots per clip)
   const rawBeats: Array<{ start: number; end: number; speaker: string; hasKeyword: boolean }> = [];
-  const lowerKws = highlight.keywords.map((k) => k.toLowerCase());
+  const lowerKws = (highlight.keywords ?? []).map((k) => k.toLowerCase());
 
   if (chunks.length === 0) {
     rawBeats.push({ start: 0, end: clipDuration, speaker: 'Speaker 1', hasKeyword: false });
@@ -337,7 +411,7 @@ function buildMontageShotPlan(params: {
       const curLen = cur.end - cur.start;
       const chHasKw = lowerKws.some((k) => ch.text.toLowerCase().includes(k));
 
-      if ((speakerChanged && curLen >= 2.0) || curLen >= 4.2) {
+      if ((speakerChanged && curLen >= 2.0) || curLen >= 4.0) {
         cur.end = ch.start;
         rawBeats.push(cur);
         cur = {
@@ -383,6 +457,8 @@ function buildMontageShotPlan(params: {
       ? 0.78
       : 0.5;
 
+  let anyShake = false;
+
   const shots: MontageShot[] = rawBeats.map((beat, idx) => {
     let focusX = baseX;
     if (hasMultiSpeakerSwitching) {
@@ -390,29 +466,46 @@ function buildMontageShotPlan(params: {
       focusX = spkIdx % 2 === 0 ? 0.28 : 0.72;
     }
 
+    const dur = Math.max(0.5, beat.end - beat.start);
+    const allowSmoothPush = (highlight.dynamicZoom && allowDynamicZoom) || energy !== 'calm';
+    const triggerImpactShake =
+      highlight.cropMode !== 'fit-blur' &&
+      ((idx === 0 && energy !== 'calm') ||
+        (energy === 'viral-shake' && (beat.hasKeyword || idx % 2 === 1)));
+
+    const overscan = triggerImpactShake ? 1.045 : 1.0;
     let zoomExpr = '1.000';
     if (enablePunchCuts) {
-      const dur = Math.max(0.5, beat.end - beat.start);
-      const allowSmoothPush = highlight.dynamicZoom && allowDynamicZoom;
       if (idx === 0) {
-        // Opening hook: crisp 0.45s snap-zoom settle into gentle slow push for immediate viewer retention
         if (allowSmoothPush) {
-          const restDur = Math.max(0.5, dur - 0.45).toFixed(2);
-          zoomExpr = `if(lt(t,0.45),(1.160-0.110*(t/0.45)),(1.050+0.040*(t-0.45)/${restDur}))`;
+          const restDur = Math.max(0.5, dur - 0.38).toFixed(2);
+          const startZ = (1.18 * overscan).toFixed(3);
+          const settleZ = (1.05 * overscan).toFixed(3);
+          const endZ = (1.095 * overscan).toFixed(3);
+          zoomExpr = `if(lt(t,0.38),(${startZ}-${(1.18 * overscan - 1.05 * overscan).toFixed(3)}*(t/0.38)),(${settleZ}+${(1.095 * overscan - 1.05 * overscan).toFixed(3)}*(t-0.38)/${restDur}))`;
         } else {
-          zoomExpr = '1.080';
+          zoomExpr = (1.08 * overscan).toFixed(3);
         }
-      } else if (beat.hasKeyword || idx % 2 === 1) {
-        // Studio close-up jump-cut punch-in on emphasis / alternate beat
+      } else if (idx % 2 === 1) {
+        // Zoom-In push on emphasis beat
         zoomExpr = allowSmoothPush
-          ? `(1.110+0.045*(t-${beat.start.toFixed(2)})/${dur.toFixed(2)})`
-          : '1.125';
+          ? `(${(1.02 * overscan).toFixed(3)}+${(0.125 * overscan).toFixed(3)}*(t-${beat.start.toFixed(2)})/${dur.toFixed(2)})`
+          : (1.12 * overscan).toFixed(3);
       } else {
-        // Clean reset to 1.00x wide framing for visual rhythm contrast
+        // Smooth Zoom-Out pullback for visual variety & reveal contrast
         zoomExpr = allowSmoothPush
-          ? `(1.000+0.040*(t-${beat.start.toFixed(2)})/${dur.toFixed(2)})`
-          : '1.000';
+          ? `(${(1.14 * overscan).toFixed(3)}-${(0.115 * overscan).toFixed(3)}*(t-${beat.start.toFixed(2)})/${dur.toFixed(2)})`
+          : (1.02 * overscan).toFixed(3);
       }
+    }
+
+    let shakeXExpr = '0';
+    let shakeYExpr = '0';
+    if (triggerImpactShake) {
+      anyShake = true;
+      const localT = `(t-${beat.start.toFixed(2)})`;
+      shakeXExpr = `if(lt(${localT},0.36),14*exp(-8.5*${localT})*sin(${localT}*54),0)`;
+      shakeYExpr = `if(lt(${localT},0.36),11*exp(-8.5*${localT})*cos(${localT}*46),0)`;
     }
 
     return {
@@ -420,10 +513,13 @@ function buildMontageShotPlan(params: {
       end: beat.end,
       zoomExpr,
       focusX,
+      shakeXExpr,
+      shakeYExpr,
+      hasShake: triggerImpactShake,
     };
   });
 
-  return { shots, hasMultiSpeakerSwitching };
+  return { shots, hasMultiSpeakerSwitching, anyShake };
 }
 
 function buildPiecewiseExpr(shots: MontageShot[], getter: (s: MontageShot) => string): string {
@@ -455,16 +551,604 @@ function getProfileColorFilters(profileId: EditingProfileId): string[] {
   }
 }
 
+function buildStitchedFallbackTranscript(
+  highlight: HighlightRecord,
+  sources: ProjectSourceVideo[],
+  transitionDurSec = 0
+): TranscriptSegment[] {
+  const out: TranscriptSegment[] = [];
+  const segs = highlight.editSegments ?? [];
+  let cursor = 0;
+  for (let idx = 0; idx < segs.length; idx++) {
+    const seg = segs[idx];
+    const segDur = Math.max(0.5, seg.endTime - seg.startTime);
+    const src = sources[seg.sourceIndex] ?? sources[0];
+    const srcLines = (src?.transcript ?? []).filter(
+      (t) => t.end > seg.startTime && t.start < seg.endTime
+    );
+    for (const line of srcLines) {
+      const localStart = Math.max(0, line.start - seg.startTime);
+      const localEnd = Math.min(segDur, line.end - seg.startTime);
+      if (localEnd - localStart < 0.15) continue;
+      out.push({
+        ...line,
+        start: Number(Math.max(0, cursor + localStart).toFixed(2)),
+        end: Number(Math.max(0.2, cursor + localEnd).toFixed(2)),
+      });
+    }
+    cursor += segDur - (idx < segs.length - 1 ? transitionDurSec : 0);
+  }
+  return out;
+}
+
+function buildAudioMixFilterGraph(params: {
+  hasVoice: boolean;
+  voiceInput: string;
+  bgmInputIdx: number | null;
+  sfxInputIdx: number | null;
+  normalizeAudio: boolean;
+  targetLufs: number;
+  clipDuration: number;
+}): { filterStr: string; mapAudio: boolean } {
+  const { hasVoice, voiceInput, bgmInputIdx, sfxInputIdx, normalizeAudio, targetLufs, clipDuration } =
+    params;
+  const hasBgm = bgmInputIdx !== null;
+  const hasSfx = sfxInputIdx !== null;
+  const audioFadeOut = Math.max(0.2, clipDuration - 0.14).toFixed(2);
+  const bgmFadeOut = Math.max(0.2, clipDuration - 0.55).toFixed(2);
+
+  if (hasVoice && (hasBgm || hasSfx)) {
+    const parts: string[] = [];
+    const baseVoice = normalizeAudio
+      ? `${voiceInput}aresample=44100:async=1:first_pts=0,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,highpass=f=75,acompressor=threshold=-18dB:ratio=2.5:attack=15:release=180`
+      : `${voiceInput}aresample=44100:async=1:first_pts=0,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo`;
+
+    if (hasBgm && hasSfx) {
+      parts.push(`${baseVoice}[vnorm];[vnorm]asplit=3[vsc_bgm][vsc_sfx][vmix]`);
+    } else if (hasBgm) {
+      parts.push(`${baseVoice}[vnorm];[vnorm]asplit=2[vsc_bgm][vmix]`);
+    } else {
+      parts.push(`${baseVoice}[vnorm];[vnorm]asplit=2[vsc_sfx][vmix]`);
+    }
+
+    const mixInputs = ['[vmix]'];
+
+    if (hasBgm && bgmInputIdx !== null) {
+      parts.push(
+        `[${bgmInputIdx}:a]aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume=0.22,lowpass=f=2800,afade=t=in:st=0:d=0.35,afade=t=out:st=${bgmFadeOut}:d=0.55[bgm0];[bgm0][vsc_bgm]sidechaincompress=threshold=0.018:ratio=7:attack=20:release=320:makeup=1[bgmd]`
+      );
+      mixInputs.push('[bgmd]');
+    }
+
+    if (hasSfx && sfxInputIdx !== null) {
+      parts.push(
+        `[${sfxInputIdx}:a]aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume=0.62[sfx0];[sfx0][vsc_sfx]sidechaincompress=threshold=0.055:ratio=2.3:attack=8:release=180:makeup=1[sfxd]`
+      );
+      mixInputs.push('[sfxd]');
+    }
+
+    parts.push(
+      `${mixInputs.join('')}amix=inputs=${mixInputs.length}:duration=first:dropout_transition=0:normalize=0,loudnorm=I=${targetLufs}:TP=-1.5:LRA=11,afade=t=in:st=0:d=0.04,afade=t=out:st=${audioFadeOut}:d=0.14[aout]`
+    );
+    return { filterStr: parts.join(';'), mapAudio: true };
+  }
+
+  if (hasVoice) {
+    const chain = normalizeAudio
+      ? `${voiceInput}aresample=44100:async=1:first_pts=0,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,highpass=f=75,acompressor=threshold=-18dB:ratio=2.5:attack=15:release=180,loudnorm=I=${targetLufs}:TP=-1.5:LRA=11,afade=t=in:st=0:d=0.04,afade=t=out:st=${audioFadeOut}:d=0.14[aout]`
+      : `${voiceInput}aresample=44100:async=1:first_pts=0,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,afade=t=in:st=0:d=0.04,afade=t=out:st=${audioFadeOut}:d=0.14[aout]`;
+    return { filterStr: chain, mapAudio: true };
+  }
+
+  if (hasBgm && hasSfx && bgmInputIdx !== null && sfxInputIdx !== null) {
+    return {
+      filterStr: `[${bgmInputIdx}:a]aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume=0.35,afade=t=in:st=0:d=0.35,afade=t=out:st=${bgmFadeOut}:d=0.55[bgm0];[${sfxInputIdx}:a]aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume=0.68[sfx0];[bgm0][sfx0]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,loudnorm=I=${targetLufs}:TP=-1.5:LRA=11[aout]`,
+      mapAudio: true,
+    };
+  }
+
+  if (hasBgm && bgmInputIdx !== null) {
+    return {
+      filterStr: `[${bgmInputIdx}:a]aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume=0.35,loudnorm=I=${targetLufs}:TP=-1.5:LRA=11,afade=t=in:st=0:d=0.35,afade=t=out:st=${bgmFadeOut}:d=0.55[aout]`,
+      mapAudio: true,
+    };
+  }
+
+  if (hasSfx && sfxInputIdx !== null) {
+    return {
+      filterStr: `[${sfxInputIdx}:a]aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume=0.68,loudnorm=I=${targetLufs}:TP=-1.5:LRA=11[aout]`,
+      mapAudio: true,
+    };
+  }
+
+  return { filterStr: '', mapAudio: false };
+}
+
+async function renderMultiSegmentRemixClip(params: {
+  projectId: string;
+  projectBrief?: string;
+  sources: ProjectSourceVideo[];
+  highlight: HighlightRecord;
+  settings: StudioSettings;
+  languageCode: string;
+  outputPath: string;
+  assPath: string;
+  tmpOutputPath: string;
+  outFilename: string;
+}): Promise<{ outputPath: string; outputUrl: string }> {
+  const {
+    projectId,
+    projectBrief,
+    sources,
+    highlight,
+    settings,
+    languageCode,
+    outputPath,
+    assPath,
+    tmpOutputPath,
+    outFilename,
+  } = params;
+  const profile = EDITING_PROFILES[highlight.editingProfile] ?? EDITING_PROFILES.Minimal;
+  const segments = highlight.editSegments ?? [];
+  const projectDir = resolveSafePath(PROJECTS_DIR, projectId);
+  const rendersDir = resolveSafePath(projectDir, 'renders');
+  const workDir = resolveSafePath(rendersDir, `remix_work_${highlight.id}_${Date.now()}`);
+  fs.mkdirSync(workDir, { recursive: true });
+
+  const transitionStyle = resolveEffectiveTransitionStyle(highlight);
+  const cameraEnergy = resolveEffectiveCameraEnergy(highlight);
+  const xfadePlan = getXfadePlan(transitionStyle);
+
+  try {
+    const segFiles: Array<{ path: string; duration: number }> = [];
+    let hasAnyAudio = false;
+
+    for (let idx = 0; idx < segments.length; idx++) {
+      const seg = segments[idx];
+      const src = sources[seg.sourceIndex] ?? sources[0];
+      if (!src?.sourcePath || !fs.existsSync(src.sourcePath)) {
+        throw new Error(`Missing source video file for remix segment #${idx + 1} (${seg.sourceFilename}).`);
+      }
+
+      // Snap segment duration to exact 30fps frame boundary to eliminate A/V drift
+      const rawDur = Math.max(1.2, seg.endTime - seg.startTime);
+      const exactFrames = Math.max(36, Math.round(rawDur * 30));
+      const exactDur = Number((exactFrames / 30).toFixed(4));
+      const segOutPath = path.join(workDir, `seg_${String(idx).padStart(2, '0')}.mov`);
+      const srcHasAudio = src.metadata?.hasAudio !== false;
+      if (srcHasAudio) hasAnyAudio = true;
+
+      // IMPORTANT: NEVER alter voice speed or pitch (no setpts multiplier / atempo)
+      let vf: string;
+      const useFitBlur = highlight.cropMode === 'fit-blur';
+      if (useFitBlur) {
+        vf =
+          `setpts=PTS-STARTPTS,` +
+          `split[bg][fg];` +
+          `[bg]crop=w='trunc(min(iw,ih*9/16)/2)*2':h='trunc(min(ih,iw*16/9)/2)*2':x='(iw-ow)/2':y='(ih-oh)/2',scale=270:480:flags=bilinear,boxblur=8:2,scale=1080:1920:flags=bilinear[bgb];` +
+          `[fg]scale=1080:1920:force_original_aspect_ratio=decrease:flags=bilinear,scale='trunc(iw/2)*2':'trunc(ih/2)*2'[fgs];` +
+          `[bgb][fgs]overlay=(W-w)/2:(H-h)/2,fps=30,trim=duration=${exactDur},setpts=PTS-STARTPTS,format=yuv420p,setsar=1`;
+      } else {
+        let cropX = '(iw-ow)/2';
+        if (highlight.cropMode === 'left-subject') cropX = '(iw-ow)*0.22';
+        if (highlight.cropMode === 'right-subject') cropX = '(iw-ow)*0.78';
+
+        const triggerShake =
+          (idx === 0 && cameraEnergy !== 'calm') ||
+          (cameraEnergy === 'viral-shake' && (seg.role === 'hook' || seg.role === 'product' || seg.role === 'payoff' || idx % 2 === 1));
+        const overscan = triggerShake ? 1.045 : 1.0;
+
+        let zoomExpr = '1.000';
+        const allowMotion = highlight.dynamicZoom || cameraEnergy !== 'calm';
+        if (allowMotion) {
+          if (idx === 0) {
+            // Opening hook snap zoom-in + smooth settle
+            const restDur = Math.max(0.4, exactDur - 0.36).toFixed(2);
+            const z0 = (1.18 * overscan).toFixed(3);
+            const z1 = (1.05 * overscan).toFixed(3);
+            const z2 = (1.095 * overscan).toFixed(3);
+            zoomExpr = `if(lt(t,0.36),(${z0}-${(1.18 * overscan - 1.05 * overscan).toFixed(3)}*(t/0.36)),(${z1}+${(1.095 * overscan - 1.05 * overscan).toFixed(3)}*(t-0.36)/${restDur}))`;
+          } else if (idx % 2 === 1 || seg.role === 'product') {
+            // Dynamic Zoom-In toward focal subject/product
+            const zA = (1.015 * overscan).toFixed(3);
+            const zDelta = (0.125 * overscan).toFixed(3);
+            zoomExpr = `(${zA}+${zDelta}*t/${exactDur.toFixed(2)})`;
+          } else {
+            // Smooth Zoom-Out reveal pullback
+            const zA = (1.14 * overscan).toFixed(3);
+            const zDelta = (0.12 * overscan).toFixed(3);
+            zoomExpr = `(${zA}-${zDelta}*t/${exactDur.toFixed(2)})`;
+          }
+        } else if (triggerShake) {
+          zoomExpr = overscan.toFixed(3);
+        }
+
+        const shakeX = triggerShake
+          ? `if(lt(t,0.36),14*exp(-8.5*t)*sin(t*54),0)`
+          : '0';
+        const shakeY = triggerShake
+          ? `if(lt(t,0.36),11*exp(-8.5*t)*cos(t*46),0)`
+          : '0';
+
+        vf =
+          `setpts=PTS-STARTPTS,` +
+          `crop=w='trunc(min(iw,ih*9/16)/2)*2':h='trunc(min(ih,iw*16/9)/2)*2':x='${cropX}':y='(ih-oh)/2'`;
+        if (zoomExpr !== '1.000' || triggerShake) {
+          vf +=
+            `,scale=w='max(1080,trunc(1080*(${zoomExpr})/2)*2)':h='max(1920,trunc(1920*(${zoomExpr})/2)*2)':eval=frame:flags=bilinear,` +
+            `crop=1080:1920:x='max(0,min(iw-1080,(iw-1080)/2+(${shakeX})))':y='max(0,min(ih-1920,(ih-1920)/2+(${shakeY})))'`;
+        } else {
+          vf += `,scale=1080:1920:flags=bilinear`;
+        }
+        vf += `,fps=30,trim=duration=${exactDur},setpts=PTS-STARTPTS,format=yuv420p,setsar=1`;
+      }
+
+      const preSeek = Math.max(0, Number((seg.startTime - 3.5).toFixed(3)));
+      const fineSeek = Number((seg.startTime - preSeek).toFixed(3));
+      const fadeOutSt = Math.max(0.04, exactDur - 0.025).toFixed(3);
+
+      const trimPrefix = `trim=start=${fineSeek}:duration=${exactDur},setpts=PTS-STARTPTS`;
+      const vfTrimmed = vf.replace(/^setpts=PTS-STARTPTS,/, `${trimPrefix},`);
+
+      const args: string[] = [
+        '-y',
+        '-ss',
+        String(preSeek),
+        '-i',
+        src.sourcePath,
+      ];
+
+      if (!srcHasAudio) {
+        args.push('-f', 'lavfi', '-t', String(exactDur), '-i', 'anullsrc=r=44100:cl=stereo');
+      }
+
+      if (useFitBlur) {
+        args.push('-filter_complex', `${vfTrimmed}[vout]`, '-map', '[vout]');
+        args.push('-map', srcHasAudio ? '0:a:0' : '1:a:0');
+      } else {
+        args.push('-vf', vfTrimmed);
+        args.push('-map', '0:v:0');
+        args.push('-map', srcHasAudio ? '0:a:0' : '1:a:0');
+      }
+
+      const audioTrimStart = srcHasAudio ? fineSeek : 0;
+      // Use uncompressed pcm_s16le with exact atrim/apad so AAC priming frames never desync cuts
+      args.push(
+        '-af',
+        `atrim=start=${audioTrimStart}:duration=${exactDur},asetpts=PTS-STARTPTS,aresample=44100:async=1:first_pts=0,aformat=sample_fmts=s16:sample_rates=44100:channel_layouts=stereo,apad=whole_dur=${exactDur},afade=t=in:st=0:d=0.015,afade=t=out:st=${fadeOutSt}:d=0.020`,
+        '-c:v',
+        'libx264',
+        '-preset',
+        'veryfast',
+        '-crf',
+        '18',
+        '-g',
+        '15',
+        '-c:a',
+        'pcm_s16le',
+        '-ar',
+        '44100',
+        '-ac',
+        '2',
+        '-t',
+        String(exactDur),
+        segOutPath
+      );
+
+      await execFileAsync('ffmpeg', args, { maxBuffer: 10 * 1024 * 1024 });
+      const segProbe = await probeVideoMetadata(segOutPath);
+      segFiles.push({
+        path: segOutPath,
+        duration: Math.max(0.5, segProbe.duration || exactDur),
+      });
+    }
+
+    const stitchedVideoPath = path.join(workDir, 'stitched_video.mov');
+    const stitchedDialogueWav = path.join(workDir, 'stitched_dialogue.wav');
+
+    const minSegDur = segFiles.reduce((m, s) => Math.min(m, s.duration), Infinity);
+    const effectiveTransDur =
+      segFiles.length >= 2 && xfadePlan.duration > 0
+        ? Number(Math.min(xfadePlan.duration, minSegDur * 0.32).toFixed(3))
+        : 0;
+
+    if (segFiles.length === 1) {
+      fs.copyFileSync(segFiles[0].path, stitchedVideoPath);
+      await execFileAsync(
+        'ffmpeg',
+        ['-y', '-i', stitchedVideoPath, '-vn', '-c:a', 'pcm_s16le', '-ar', '44100', '-ac', '2', stitchedDialogueWav],
+        { maxBuffer: 10 * 1024 * 1024 }
+      );
+    } else {
+      const stitchArgs: string[] = ['-y'];
+      for (const sf of segFiles) {
+        stitchArgs.push('-i', sf.path);
+      }
+
+      const filterParts: string[] = [];
+      if (effectiveTransDur > 0.04) {
+        // Chain xfade (video) and acrossfade (audio) with identical overlap duration so A/V remain 100% locked
+        let curV = '[0:v]';
+        let curA = '[0:a]';
+        let cumDur = segFiles[0].duration;
+
+        for (let i = 1; i < segFiles.length; i++) {
+          const offset = Math.max(0.1, Number((cumDur - effectiveTransDur).toFixed(4)));
+          const txName = xfadePlan.transitions[(i - 1) % xfadePlan.transitions.length];
+          const nextV = i === segFiles.length - 1 ? '[vout]' : `[vx${i}]`;
+          const nextA = i === segFiles.length - 1 ? '[aout]' : `[ax${i}]`;
+
+          filterParts.push(
+            `${curV}[${i}:v]xfade=transition=${txName}:duration=${effectiveTransDur}:offset=${offset}${nextV}`
+          );
+          filterParts.push(
+            `${curA}[${i}:a]acrossfade=d=${effectiveTransDur}:c1=tri:c2=tri${nextA}`
+          );
+
+          curV = nextV;
+          curA = nextA;
+          cumDur = cumDur + segFiles[i].duration - effectiveTransDur;
+        }
+      } else {
+        const inputs = segFiles.map((_, idx) => `[${idx}:v][${idx}:a]`).join('');
+        filterParts.push(`${inputs}concat=n=${segFiles.length}:v=1:a=1[vout][aout]`);
+      }
+
+      stitchArgs.push(
+        '-filter_complex',
+        filterParts.join(';'),
+        '-map',
+        '[vout]',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'veryfast',
+        '-crf',
+        '18',
+        '-pix_fmt',
+        'yuv420p',
+        stitchedVideoPath,
+        '-map',
+        '[aout]',
+        '-c:a',
+        'pcm_s16le',
+        '-ar',
+        '44100',
+        '-ac',
+        '2',
+        stitchedDialogueWav
+      );
+
+      await execFileAsync('ffmpeg', stitchArgs, { maxBuffer: 15 * 1024 * 1024 });
+    }
+
+    const stitchedProbe = await probeVideoMetadata(stitchedVideoPath);
+    const clipDuration = Math.max(1, Number(stitchedProbe.duration.toFixed(2)));
+    const fallbackTranscript = buildStitchedFallbackTranscript(highlight, sources, effectiveTransDur);
+    const segHash = crypto
+      .createHash('sha1')
+      .update(
+        `${transitionStyle}|` +
+          segments.map((s) => `${s.sourceIndex}:${s.startTime.toFixed(2)}-${s.endTime.toFixed(2)}`).join('|')
+      )
+      .digest('hex')
+      .slice(0, 10);
+
+    // Align subtitles directly against the CLEAN stitched dialogue stem BEFORE mixing background music
+    const alignedCues = hasAnyAudio
+      ? await alignClipSubtitlesWithAudio({
+          projectId,
+          sourcePath: stitchedDialogueWav,
+          highlightId: highlight.id,
+          startTime: 0,
+          endTime: clipDuration,
+          fallbackTranscript,
+          languageHint: languageCode,
+          overrideCacheKey: `${highlight.id}_remix_${segHash}`,
+        })
+      : fallbackTranscript.map((s) => ({
+          start: s.start,
+          end: Math.min(clipDuration, s.end),
+          speaker: s.speaker,
+          text: s.text,
+        }));
+
+    generateAssSubtitleFile({
+      outAssPath: assPath,
+      highlight,
+      alignedCues,
+      clipDuration,
+      settings,
+      languageCode,
+    });
+
+    const bgmVibe = resolveHighlightBgmVibe(highlight, projectBrief);
+    const bgmWavPath = await ensureBgmTrack(bgmVibe);
+
+    const sfxMode = resolveHighlightSfxMode(highlight, projectBrief);
+    const sfxEvents: SfxEvent[] = [];
+    if (sfxMode !== 'none') {
+      let prevCue: SfxEvent['cue'] | null = null;
+      let segCursor = 0;
+      for (let i = 0; i < segments.length; i++) {
+        const seg = segments[i];
+        const segDur = segFiles[i]?.duration ?? Math.max(1.2, seg.endTime - seg.startTime);
+        const src = sources[seg.sourceIndex] ?? sources[0];
+        const segText = (src?.transcript ?? [])
+          .filter((t) => t.end > seg.startTime && t.start < seg.endTime)
+          .map((t) => t.text)
+          .join(' ');
+
+        const cue = inferSceneSfxCue({
+          explicitCue: i === 0 ? highlight.hookSfx ?? seg.sfxCue : seg.sfxCue,
+          mode: sfxMode,
+          text: `${i === 0 ? highlight.hookHeadline || highlight.title : ''} ${segText}`,
+          visualNote: seg.visualNote,
+          role: seg.role,
+          keywords: highlight.keywords,
+          categoryId: highlight.categoryId,
+          transitionStyle,
+          isHook: i === 0,
+          previousCue: prevCue,
+          seedIdx: i,
+        });
+
+        if (cue) {
+          const eventTime = i === 0 ? 0.08 : Math.max(0.25, Number((segCursor - 0.08).toFixed(3)));
+          sfxEvents.push({
+            cue,
+            timeSec: eventTime,
+            gain: i === 0 ? 0.78 : cue === 'whoosh-swish' ? 0.65 : 0.72,
+          });
+          prevCue = cue;
+        }
+        segCursor += segDur - (i < segments.length - 1 ? effectiveTransDur : 0);
+      }
+
+      // Optional mid-clip semantic reaction cue on longer clips if aligned subtitle hits a keyword/emotion beat
+      for (const ac of alignedCues) {
+        if (ac.start < 2.2 || ac.start > clipDuration - 1.5) continue;
+        const tooClose = sfxEvents.some((e) => Math.abs(e.timeSec - ac.start) < 2.2);
+        if (tooClose) continue;
+        if (/\b(wrong|mistake|never|shock|omg|what|clever|smart|tip|gift|kitsch|click|look)\b/i.test(ac.text)) {
+          const midCue = inferSceneSfxCue({
+            mode: sfxMode,
+            text: ac.text,
+            keywords: highlight.keywords,
+            categoryId: highlight.categoryId,
+            previousCue: prevCue,
+            seedIdx: sfxEvents.length + 3,
+          });
+          if (midCue) {
+            sfxEvents.push({ cue: midCue, timeSec: Number(ac.start.toFixed(3)), gain: 0.68 });
+            prevCue = midCue;
+            break;
+          }
+        }
+      }
+    }
+
+    const sfxTrackPath = await renderCompositeSfxTrack({
+      clipDuration,
+      events: sfxEvents,
+      outWavPath: path.join(workDir, 'sfx_track.wav'),
+    });
+
+    const escapedAss = assPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+    const postFilters: string[] = [...getProfileColorFilters(profile.id)];
+    if (profile.fadeTransitionSec > 0 && clipDuration > 2.5) {
+      const fade = profile.fadeTransitionSec;
+      const fadeOutStart = Math.max(0.5, clipDuration - fade).toFixed(2);
+      postFilters.push(`fade=t=in:st=0:d=${fade},fade=t=out:st=${fadeOutStart}:d=${fade}`);
+    }
+    postFilters.push(`ass='${escapedAss}'`);
+
+    const hasBgm = Boolean(bgmWavPath && fs.existsSync(bgmWavPath));
+    const hasSfx = Boolean(sfxTrackPath && fs.existsSync(sfxTrackPath));
+    const finalArgs: string[] = ['-y', '-i', stitchedVideoPath];
+    let nextInputIdx = 1;
+    let voiceInputIdx: number | null = null;
+    let bgmInputIdx: number | null = null;
+    let sfxInputIdx: number | null = null;
+
+    if (hasAnyAudio) {
+      finalArgs.push('-i', stitchedDialogueWav);
+      voiceInputIdx = nextInputIdx++;
+    }
+    if (hasBgm && bgmWavPath) {
+      finalArgs.push('-stream_loop', '-1', '-t', String(clipDuration), '-i', bgmWavPath);
+      bgmInputIdx = nextInputIdx++;
+    }
+    if (hasSfx && sfxTrackPath) {
+      finalArgs.push('-i', sfxTrackPath);
+      sfxInputIdx = nextInputIdx++;
+    }
+
+    const targetLufs = settings.audioTargetLufs || -14;
+    const { filterStr, mapAudio } = buildAudioMixFilterGraph({
+      hasVoice: hasAnyAudio && voiceInputIdx !== null,
+      voiceInput: voiceInputIdx !== null ? `[${voiceInputIdx}:a]` : '[1:a]',
+      bgmInputIdx,
+      sfxInputIdx,
+      normalizeAudio: highlight.normalizeAudio,
+      targetLufs,
+      clipDuration,
+    });
+
+    if (mapAudio) {
+      finalArgs.push(
+        '-filter_complex',
+        `[0:v]${postFilters.join(',')}[vout];${filterStr}`,
+        '-map',
+        '[vout]',
+        '-map',
+        '[aout]',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '192k',
+        '-ar',
+        '44100'
+      );
+    } else {
+      finalArgs.push('-vf', postFilters.join(','), '-an');
+    }
+
+    finalArgs.push(
+      '-c:v',
+      'libx264',
+      '-preset',
+      'veryfast',
+      '-crf',
+      '21',
+      '-threads',
+      '0',
+      '-max_muxing_queue_size',
+      '1024',
+      '-pix_fmt',
+      'yuv420p',
+      '-movflags',
+      '+faststart',
+      tmpOutputPath
+    );
+
+    await execFileAsync('ffmpeg', finalArgs, { maxBuffer: 10 * 1024 * 1024 });
+    fs.renameSync(tmpOutputPath, outputPath);
+
+    return {
+      outputPath,
+      outputUrl: `/api/projects/${encodeURIComponent(projectId)}/renders/${encodeURIComponent(
+        outFilename
+      )}?v=${Date.now()}`,
+    };
+  } catch (err) {
+    if (fs.existsSync(tmpOutputPath)) {
+      try {
+        fs.unlinkSync(tmpOutputPath);
+      } catch {
+        // ignore
+      }
+    }
+    throw err;
+  } finally {
+    if (fs.existsSync(workDir)) {
+      fs.rmSync(workDir, { recursive: true, force: true });
+    }
+  }
+}
+
 export async function renderAdaptiveClip(params: {
   projectId: string;
+  projectBrief?: string;
   sourcePath: string;
   metadata: VideoMetadata | null;
   highlight: HighlightRecord;
   transcript: TranscriptSegment[];
   settings: StudioSettings;
   languageCode: string;
+  sources?: ProjectSourceVideo[];
 }): Promise<{ outputPath: string; outputUrl: string }> {
-  const { projectId, sourcePath, metadata, highlight, transcript, settings, languageCode } = params;
+  const { projectId, projectBrief, sourcePath, metadata, highlight, transcript, settings, languageCode, sources } = params;
 
   const projectDir = resolveSafePath(PROJECTS_DIR, projectId);
   const rendersDir = resolveSafePath(projectDir, 'renders');
@@ -476,6 +1160,21 @@ export async function renderAdaptiveClip(params: {
 
   const tmpFilename = `${highlight.id}.tmp.${Date.now()}.mp4`;
   const tmpOutputPath = resolveSafePath(rendersDir, tmpFilename);
+
+  if (highlight.editSegments && highlight.editSegments.length > 0 && sources && sources.length > 0) {
+    return renderMultiSegmentRemixClip({
+      projectId,
+      projectBrief,
+      sources,
+      highlight,
+      settings,
+      languageCode,
+      outputPath,
+      assPath,
+      tmpOutputPath,
+      outFilename,
+    });
+  }
 
   const profile = EDITING_PROFILES[highlight.editingProfile] ?? EDITING_PROFILES.Minimal;
   const clipDuration = Math.max(1, Number((highlight.endTime - highlight.startTime).toFixed(2)));
@@ -515,7 +1214,7 @@ export async function renderAdaptiveClip(params: {
   const srcHeight = metadata?.height || 1080;
   const isLandscapeSource = srcWidth / Math.max(1, srcHeight) > 1.15;
 
-  const { shots, hasMultiSpeakerSwitching } = buildMontageShotPlan({
+  const { shots, hasMultiSpeakerSwitching, anyShake } = buildMontageShotPlan({
     chunks,
     clipDuration,
     highlight,
@@ -526,10 +1225,12 @@ export async function renderAdaptiveClip(params: {
 
   const escapedAss = assPath.replace(/\\/g, '/').replace(/:/g, '\\:');
 
-  // Step 3: Build montage video filtergraph starting with PTS normalization for exact A/V/subtitle sync
+  // Step 3: Build montage video filtergraph starting with PTS normalization + zoom-in/out & damped shake
   const zoomExpr = buildPiecewiseExpr(shots, (s) => s.zoomExpr);
   const focusXExpr = buildPiecewiseExpr(shots, (s) => s.focusX.toFixed(2));
-  const needsDynamicZoomOrCuts = shots.some((s) => s.zoomExpr !== '1.000');
+  const shakeXExpr = anyShake ? buildPiecewiseExpr(shots, (s) => s.shakeXExpr) : '0';
+  const shakeYExpr = anyShake ? buildPiecewiseExpr(shots, (s) => s.shakeYExpr) : '0';
+  const needsDynamicZoomOrCuts = shots.some((s) => s.zoomExpr !== '1.000') || anyShake;
 
   let baseVideoFilter: string;
   const useComplex = highlight.cropMode === 'fit-blur';
@@ -539,15 +1240,13 @@ export async function renderAdaptiveClip(params: {
       `setpts=PTS-STARTPTS,split[bg][fg];` +
       `[bg]crop=w='trunc(min(iw,ih*9/16)/2)*2':h='trunc(min(ih,iw*16/9)/2)*2':x='(iw-ow)/2':y='(ih-oh)/2',scale=270:480:flags=bilinear,boxblur=8:2,scale=1080:1920:flags=bilinear[bgb];` +
       `[fg]scale=1080:1920:force_original_aspect_ratio=decrease:flags=bilinear,scale='trunc(iw/2)*2':'trunc(ih/2)*2'[fgs];` +
-      `[bgb][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1`;
+      `[bgb][fgs]overlay=(W-w)/2:(H-h)/2,fps=30,setsar=1`;
   } else if (hasMultiSpeakerSwitching) {
-    // Keep wide frame horizontally so camera switches cleanly between Left & Right speakers + punch-ins
     baseVideoFilter =
       `setpts=PTS-STARTPTS,` +
       `scale=w='trunc(max(1080,iw*1920/ih)*(${zoomExpr})/2)*2':h='trunc(max(1920,ih*1080/iw)*(${zoomExpr})/2)*2':eval=frame:flags=bilinear,` +
-      `crop=1080:1920:x='(iw-1080)*(${focusXExpr})':y='(ih-1920)/2',setsar=1`;
+      `crop=1080:1920:x='max(0,min(iw-1080,(iw-1080)*(${focusXExpr})+(${shakeXExpr})))':y='max(0,min(ih-1920,(ih-1920)/2+(${shakeYExpr})))',fps=30,setsar=1`;
   } else {
-    // Crop 9:16 first on source resolution for maximum encode speed, then apply beat punch-in/zoom cuts
     let cropX = '(iw-ow)/2';
     if (highlight.cropMode === 'left-subject') cropX = '(iw-ow)*0.22';
     if (highlight.cropMode === 'right-subject') cropX = '(iw-ow)*0.78';
@@ -559,9 +1258,9 @@ export async function renderAdaptiveClip(params: {
     if (needsDynamicZoomOrCuts) {
       baseVideoFilter +=
         `,scale=w='max(1080,trunc(1080*(${zoomExpr})/2)*2)':h='max(1920,trunc(1920*(${zoomExpr})/2)*2)':eval=frame:flags=bilinear,` +
-        `crop=1080:1920:x='(iw-1080)/2':y='(ih-1920)/2',setsar=1`;
+        `crop=1080:1920:x='max(0,min(iw-1080,(iw-1080)/2+(${shakeXExpr})))':y='max(0,min(ih-1920,(ih-1920)/2+(${shakeYExpr})))',fps=30,setsar=1`;
     } else {
-      baseVideoFilter += `,scale=1080:1920:flags=bilinear,setsar=1`;
+      baseVideoFilter += `,scale=1080:1920:flags=bilinear,fps=30,setsar=1`;
     }
   }
 
@@ -573,9 +1272,72 @@ export async function renderAdaptiveClip(params: {
   }
   postFilters.push(`ass='${escapedAss}'`);
 
-  // Hybrid seek (pre-seek before -i + fine-seek after -i) eliminates keyframe audio/subtitle offset
+  const bgmVibe = resolveHighlightBgmVibe(highlight, projectBrief);
+  const bgmWavPath = await ensureBgmTrack(bgmVibe);
+  const hasBgm = Boolean(bgmWavPath && fs.existsSync(bgmWavPath));
+
+  const sfxMode = resolveHighlightSfxMode(highlight, projectBrief);
+  const transitionStyle = resolveEffectiveTransitionStyle(highlight);
+  const sfxEvents: SfxEvent[] = [];
+  if (sfxMode !== 'none') {
+    let prevCue: SfxEvent['cue'] | null = null;
+    const hookText = `${highlight.hookHeadline || highlight.title} ${chunks[0]?.text || ''}`;
+    const hookCue = inferSceneSfxCue({
+      explicitCue: highlight.hookSfx,
+      mode: sfxMode,
+      text: hookText,
+      keywords: highlight.keywords,
+      categoryId: highlight.categoryId,
+      transitionStyle,
+      isHook: true,
+      previousCue: null,
+      seedIdx: 0,
+    });
+    if (hookCue) {
+      sfxEvents.push({ cue: hookCue, timeSec: 0.08, gain: 0.78 });
+      prevCue = hookCue;
+    }
+
+    for (let sIdx = 1; sIdx < shots.length; sIdx++) {
+      const sh = shots[sIdx];
+      if (sh.start < 1.8 || sh.start > clipDuration - 0.6) continue;
+      const nearbyText = chunks
+        .filter((c) => c.end >= sh.start - 0.4 && c.start <= sh.end)
+        .map((c) => c.text)
+        .join(' ');
+      const shotCue = inferSceneSfxCue({
+        mode: sfxMode,
+        text: nearbyText,
+        keywords: highlight.keywords,
+        categoryId: highlight.categoryId,
+        transitionStyle,
+        previousCue: prevCue,
+        seedIdx: sIdx,
+      });
+      if (shotCue) {
+        sfxEvents.push({
+          cue: shotCue,
+          timeSec: Math.max(0.25, Number((sh.start - 0.05).toFixed(3))),
+          gain: shotCue === 'whoosh-swish' ? 0.64 : 0.72,
+        });
+        prevCue = shotCue;
+      }
+    }
+  }
+
+  const tmpSfxWavPath = resolveSafePath(rendersDir, `${highlight.id}.sfx.${Date.now()}.wav`);
+  const sfxTrackPath = await renderCompositeSfxTrack({
+    clipDuration,
+    events: sfxEvents,
+    outWavPath: tmpSfxWavPath,
+  });
+  const hasSfx = Boolean(sfxTrackPath && fs.existsSync(sfxTrackPath));
+
+  // Hybrid seek: keyframe pre-seek before -i + exact filtergraph trim/atrim for millisecond A/V sync
   const preSeek = Math.max(0, Number((highlight.startTime - 4).toFixed(3)));
   const fineSeek = Number((highlight.startTime - preSeek).toFixed(3));
+  const singleTrimPrefix = `trim=start=${fineSeek}:duration=${clipDuration},setpts=PTS-STARTPTS`;
+  const trimmedBaseVideoFilter = baseVideoFilter.replace(/^setpts=PTS-STARTPTS,/, `${singleTrimPrefix},`);
 
   const args: string[] = [
     '-y',
@@ -583,34 +1345,51 @@ export async function renderAdaptiveClip(params: {
     String(preSeek),
     '-i',
     sourcePath,
-    '-ss',
-    String(fineSeek),
-    '-t',
-    String(clipDuration),
-    '-avoid_negative_ts',
-    'make_zero',
   ];
 
-  if (useComplex) {
-    const chain = `${baseVideoFilter},${postFilters.join(',')}[vout]`;
-    args.push('-filter_complex', chain, '-map', '[vout]');
-    if (metadata?.hasAudio !== false) {
-      args.push('-map', '0:a?');
-    }
-  } else {
-    args.push('-vf', `${baseVideoFilter},${postFilters.join(',')}`);
+  let nextInputIdx = 1;
+  let bgmInputIdx: number | null = null;
+  let sfxInputIdx: number | null = null;
+  if (hasBgm && bgmWavPath) {
+    args.push('-stream_loop', '-1', '-t', String(clipDuration), '-i', bgmWavPath);
+    bgmInputIdx = nextInputIdx++;
+  }
+  if (hasSfx && sfxTrackPath) {
+    args.push('-i', sfxTrackPath);
+    sfxInputIdx = nextInputIdx++;
   }
 
-  if (metadata?.hasAudio !== false) {
-    const targetLufs = settings.audioTargetLufs || -14;
-    const audioFadeOut = Math.max(0.2, clipDuration - 0.1).toFixed(2);
-    const audioChain = highlight.normalizeAudio
-      ? `asetpts=PTS-STARTPTS,highpass=f=75,acompressor=threshold=-18dB:ratio=2.5:attack=15:release=180,loudnorm=I=${targetLufs}:TP=-1.5:LRA=11,afade=t=in:st=0:d=0.06,afade=t=out:st=${audioFadeOut}:d=0.10`
-      : `asetpts=PTS-STARTPTS,afade=t=in:st=0:d=0.06,afade=t=out:st=${audioFadeOut}:d=0.10`;
-    args.push('-af', audioChain);
-    args.push('-c:a', 'aac', '-b:a', '192k', '-ar', '44100');
+  const targetLufs = settings.audioTargetLufs || -14;
+  const hasVoice = metadata?.hasAudio !== false;
+
+  if (useComplex || hasBgm || hasSfx) {
+    const videoChain = `${trimmedBaseVideoFilter},${postFilters.join(',')}[vout]`;
+    const { filterStr, mapAudio } = buildAudioMixFilterGraph({
+      hasVoice,
+      voiceInput: `[0:a]atrim=start=${fineSeek}:duration=${clipDuration},asetpts=PTS-STARTPTS,`,
+      bgmInputIdx,
+      sfxInputIdx,
+      normalizeAudio: highlight.normalizeAudio,
+      targetLufs,
+      clipDuration,
+    });
+    if (mapAudio) {
+      args.push('-filter_complex', `${videoChain};${filterStr}`, '-map', '[vout]', '-map', '[aout]');
+      args.push('-c:a', 'aac', '-b:a', '192k', '-ar', '44100');
+    } else {
+      args.push('-filter_complex', videoChain, '-map', '[vout]', '-an');
+    }
   } else {
-    args.push('-an');
+    args.push('-vf', `${trimmedBaseVideoFilter},${postFilters.join(',')}`);
+    if (hasVoice) {
+      const audioFadeOut = Math.max(0.2, clipDuration - 0.14).toFixed(2);
+      const audioChain = highlight.normalizeAudio
+        ? `atrim=start=${fineSeek}:duration=${clipDuration},asetpts=PTS-STARTPTS,aresample=44100:async=1:first_pts=0,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,highpass=f=75,acompressor=threshold=-18dB:ratio=2.5:attack=15:release=180,loudnorm=I=${targetLufs}:TP=-1.5:LRA=11,afade=t=in:st=0:d=0.04,afade=t=out:st=${audioFadeOut}:d=0.14`
+        : `atrim=start=${fineSeek}:duration=${clipDuration},asetpts=PTS-STARTPTS,aresample=44100:async=1:first_pts=0,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,afade=t=in:st=0:d=0.04,afade=t=out:st=${audioFadeOut}:d=0.14`;
+      args.push('-af', audioChain, '-c:a', 'aac', '-b:a', '192k', '-ar', '44100');
+    } else {
+      args.push('-an');
+    }
   }
 
   args.push(
@@ -643,6 +1422,14 @@ export async function renderAdaptiveClip(params: {
       }
     }
     throw err;
+  } finally {
+    if (fs.existsSync(tmpSfxWavPath)) {
+      try {
+        fs.unlinkSync(tmpSfxWavPath);
+      } catch {
+        // ignore cleanup error
+      }
+    }
   }
 
   return {

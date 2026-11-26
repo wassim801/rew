@@ -5,20 +5,35 @@ import fs from 'fs';
 import path from 'path';
 import { promisify } from 'util';
 import type {
+  BgmVibe,
+  CameraEnergy,
   CategoryConfig,
   ContentAnalysis,
   CropFocusMode,
   EditingProfileId,
   HighlightRecord,
   HighlightScoreBreakdown,
+  ProjectSourceVideo,
+  RemixSegment,
+  SceneKeyframe,
+  SfxCueType,
+  SfxMode,
   StudioSettings,
   SubtitleStylePreset,
+  ThumbnailVibeStyle,
   TranscriptSegment,
+  TransitionStyle,
   VideoMetadata,
 } from '../../types/studio';
 import { EDITING_PROFILES, findCategoryByIdOrName } from '../categories';
 import { PROJECTS_DIR, resolveSafePath } from '../db';
 import { getGeminiClient, withModelFallback } from '../geminiClient';
+import {
+  VALID_THUMBNAIL_STYLES,
+  deriveFallbackThumbnailCopy,
+  resolveThumbnailStyle,
+  splitGraphemeEmojis,
+} from './thumbnailAgent';
 import { detectSpeechIntervals } from './transcriptionAgent';
 
 const execFileAsync = promisify(execFile);
@@ -283,11 +298,11 @@ async function polishHighlightAcousticBounds(params: {
 
     const polishedStart = Math.max(
       0,
-      Math.min(startTime + 1.5, padStart + firstVoiced.start - 0.12)
+      Math.min(startTime + 1.5, padStart + firstVoiced.start - 0.16)
     );
     const polishedEnd = Math.min(
       totalDuration,
-      Math.max(polishedStart + 3, padStart + lastVoiced.end + 0.22)
+      Math.max(polishedStart + 3, padStart + lastVoiced.end + 0.32)
     );
 
     // Guard against over-aggressive shifts (>2.5s) vs transcript-verified bounds
@@ -311,16 +326,624 @@ async function polishHighlightAcousticBounds(params: {
   }
 }
 
+async function generateMultiSourceRemixHighlights(params: {
+  projectId: string;
+  title: string;
+  brief?: string;
+  sources: ProjectSourceVideo[];
+  scenes: SceneKeyframe[];
+  analysis: ContentAnalysis;
+  settings: StudioSettings;
+}): Promise<HighlightRecord[]> {
+  const { projectId, title, brief, sources, scenes, analysis, settings } = params;
+  const category = findCategoryByIdOrName(analysis.primaryCategoryId, settings.customCategories);
+  const profileSpec =
+    EDITING_PROFILES[analysis.recommendedProfile] ?? EDITING_PROFILES[category.defaultEditingProfile];
+  const ai = getGeminiClient();
+
+  const cleanBrief = brief?.trim() || '';
+  const briefBlock = cleanBrief
+    ? `\nUSER CONSIGNE / CAMPAIGN BRIEF (MANDATORY COMPLIANCE):\n"""\n${cleanBrief}\n"""\n${
+        analysis.briefInterpretation ? `AI Editorial & Compliance Plan: ${analysis.briefInterpretation}\n` : ''
+      }`
+    : analysis.briefInterpretation
+    ? `\nAI Editorial Plan: ${analysis.briefInterpretation}\n`
+    : '';
+
+  const VALID_PROFILES = Object.keys(EDITING_PROFILES) as EditingProfileId[];
+  const VALID_CROP_MODES: CropFocusMode[] = [
+    'auto-speaker',
+    'center',
+    'left-subject',
+    'right-subject',
+    'fit-blur',
+  ];
+  const VALID_SUBTITLE_STYLES: SubtitleStylePreset[] = [
+    'karaoke-pop',
+    'bold-highlight',
+    'clean',
+    'minimal-caption',
+  ];
+
+  // Extract dense visual keyframes (every ~6-10s per source, up to 6 per clip) so AI knows exact timestamps of visual moments & products
+  const parts: Array<{ inlineData: { mimeType: string; data: string } } | { text: string }> = [];
+  const tmpFramesDir = resolveSafePath(
+    PROJECTS_DIR,
+    projectId,
+    'renders',
+    `remix_frames_${Date.now()}`
+  );
+  fs.mkdirSync(tmpFramesDir, { recursive: true });
+
+  const sampledFrameSummary: string[] = [];
+  try {
+    for (const src of sources) {
+      const dur = src.metadata?.duration ?? 30;
+      const count = Math.min(5, Math.max(3, Math.floor(dur / 10)));
+      for (let i = 0; i < count; i++) {
+        const ts = Number(Math.max(0.3, Math.min(dur - 0.3, ((i + 0.5) / count) * dur)).toFixed(2));
+        const framePath = path.join(tmpFramesDir, `src${src.index}_f${i}.jpg`);
+        try {
+          if (src.sourcePath && fs.existsSync(src.sourcePath)) {
+            await execFileAsync(
+              'ffmpeg',
+              [
+                '-y',
+                '-nostats',
+                '-loglevel',
+                'error',
+                '-ss',
+                String(ts),
+                '-i',
+                src.sourcePath,
+                '-frames:v',
+                '1',
+                '-vf',
+                'scale=360:-2',
+                '-q:v',
+                '5',
+                framePath,
+              ],
+              { maxBuffer: 2 * 1024 * 1024 }
+            );
+          }
+          if (fs.existsSync(framePath)) {
+            parts.push({
+              text: `Frame from Source #${src.index} ("${src.filename}") at ${ts.toFixed(1)}s:`,
+            });
+            parts.push({
+              inlineData: {
+                mimeType: 'image/jpeg',
+                data: fs.readFileSync(framePath).toString('base64'),
+              },
+            });
+            sampledFrameSummary.push(`Source #${src.index} @ ${ts.toFixed(1)}s`);
+          }
+        } catch {
+          // Best-effort frame extraction
+        }
+      }
+    }
+
+    // Fallback to pre-extracted project scenes if live extraction returned nothing
+    if (sampledFrameSummary.length === 0 && scenes.length > 0) {
+      const scenesDir = resolveSafePath(PROJECTS_DIR, projectId, 'scenes');
+      for (const sc of scenes.slice(0, 10)) {
+        const fn = sc.thumbnailUrl.split('/').pop();
+        if (!fn) continue;
+        const p = resolveSafePath(scenesDir, fn);
+        if (fs.existsSync(p)) {
+          parts.push({
+            text: `Frame from Source #${sc.sourceIndex ?? 0} (${sc.sourceFilename || 'clip'}) at ${sc.timestamp.toFixed(1)}s:`,
+          });
+          parts.push({
+            inlineData: { mimeType: 'image/jpeg', data: fs.readFileSync(p).toString('base64') },
+          });
+        }
+      }
+    }
+
+    const sourceDetailsText = sources
+      .map((src) => {
+        const dur = src.metadata?.duration ?? 0;
+        const lines = (src.transcript ?? []).map(
+          (t) => `[${t.start.toFixed(2)}s -> ${t.end.toFixed(2)}s] (${t.speaker}): ${t.text}`
+        );
+        return `=== SOURCE #${src.index}: "${src.filename}" | Duration: ${dur.toFixed(2)}s | Resolution: ${
+          src.metadata?.width ?? 0
+        }x${src.metadata?.height ?? 0} ===\n${
+          lines.join('\n') || '(No spoken dialogue in this source — use visual frame timestamps above)'
+        }`;
+      })
+      .join('\n\n');
+
+    const minTotal = Math.max(12, Math.min(20, settings.minClipDuration || 15));
+    const maxTotal = Math.max(minTotal + 10, Math.min(55, settings.maxClipDuration || 45));
+
+    const sourceSpeechIntervals = new Map<number, Array<{ start: number; end: number }>>();
+    for (const src of sources) {
+      const audioTarget =
+        src.audioPath && fs.existsSync(src.audioPath)
+          ? src.audioPath
+          : src.sourcePath && fs.existsSync(src.sourcePath)
+          ? src.sourcePath
+          : null;
+      if (audioTarget && src.metadata?.hasAudio !== false) {
+        const dur = src.metadata?.duration ?? 60;
+        sourceSpeechIntervals.set(src.index, await detectSpeechIntervals(audioTarget, dur));
+      } else {
+        sourceSpeechIntervals.set(src.index, []);
+      }
+    }
+
+    parts.push({
+      text: `You are the Senior Viral Short-Form Remix Director & Brand Campaign Editor.
+You have ${sources.length} raw source video files. Your job is to MIX AND MATCH cuts ACROSS these source videos to produce 5 to 7 distinct, high-retention, scroll-stopping vertical (9:16) viral videos ready for TikTok, Instagram Reels, and YouTube Shorts.
+
+Project Title: "${title}"
+Detected Language: ${analysis.detectedLanguage} (${analysis.languageCode})
+Primary Category: ${category.name}
+${briefBlock}
+CRITICAL REMIX & COMPLIANCE RULES:
+1. NO RAW REPOSTS: NEVER output a single uncut segment from 1 video. EVERY generated video MUST be a curated montage of 2 to 5 fast-paced cuts ("segments"), actively mixing moments across multiple source videos (e.g., grab an exciting visual/verbal Hook from Source #1 or #2, cut to Product/Action from Source #0, finish with the funniest/sweetest Payoff reaction from Source #2).
+2. STRICT CONSIGNE COMPLIANCE: Read every rule in USER CONSIGNE carefully. If the brief requires showing a specific product/person on screen in every clip, verify against the attached frames and include a segment where it is clearly visible! Never include banned topics or altered voice speeds.
+3. VARIED PRO EDITING STYLES, MUSIC & TRANSITIONS: Give each generated video a DIFFERENT narrative angle, punchy hookHeadline (3–6 words), and VARIED creative direction:
+   - editingProfile: mix "${VALID_PROFILES.join('", "')}"
+   - subtitleStyle: mix "karaoke-pop", "bold-highlight", "clean" with high-contrast #RRGGBB highlightColor
+   - bgmVibe: choose from "upbeat-pop", "lofi-warm", "hype-beat", "cinematic-warm", or "none" (use "none" ONLY if brief forbids music or pure ASMR/raw speech fits best; otherwise match the mood, e.g. "upbeat-pop" for fun/holiday/gifts, "cinematic-warm" for sweet emotional family reveals, "hype-beat" for fast energetic hooks!)
+   - transitionStyle: mix "whip-slide", "zoom-punch", "dissolve", "flash-cut", "hard-cut"
+   - cameraEnergy: mix "dynamic" (smooth zoom-in/zoom-out + hook pop), "viral-shake" (impact vibration + fast punches), "calm" (gentle cinematic motion)
+   - sfxMode: choose from "playful-viral", "dramatic-impact", "smart-ui", "subtle-clean", or "none" (use "none" ONLY if brief explicitly bans sound effects; otherwise tailor to the clip vibe!)
+   - hookSfx & per-segment sfxCue: creatively match sound effects to each scene & highlight type from ["mouse-click", "clever-ding", "shock-boom", "buzz-zap", "whoosh-swish", "pop-bubble", "cash-sparkle", "riser-hit", "none"]:
+     * "buzz-zap" for mistakes, awkward/funny fails, tense warnings, or "oops" beats
+     * "shock-boom" for jaw-dropping hooks, surprises, plot twists, or big reactions
+     * "clever-ding" for smart tips, clever punchlines, "aha!" insights, or smooth reveals
+     * "mouse-click" for on-screen text/UI pops, quick steps, or cursor/demo beats
+     * "cash-sparkle" or "pop-bubble" for gifts, cute/sweet moments, product reveals, or wins
+     * "whoosh-swish" or "riser-hit" for fast transitions or suspense build-ups
+      * IMPORTANT: NEVER assign the exact same sfxCue twice in a row on consecutive segments (avoid repetitive SFX)!
+   - COVER THUMBNAIL DIRECTION (attractive vertical cover matching this specific highlight & video vibe):
+     * thumbnailText: 2 to 4 ultra-punchy scroll-stopping cover words in ${analysis.detectedLanguage} (e.g., "SAINT NIC TAX", "HUGE KITSCH DROP", "WAIT WHO IS IT?")
+     * thumbnailEmojis: array of 2 to 3 expressive emojis that fit the exact moment & emotion (e.g., ["🎅", "😭", "🎁"] or ["✨", "💖", "🔥"])
+     * thumbnailStyle: choose best cover vibe from ["viral-pop", "lifestyle-warm", "cinematic-editorial", "comedy-sticker", "tech-neon", "podcast-quote"] matching this clip & brand vibe
+     * thumbnailSegmentIndex: 0-based index into your segments array showing the clearest hero face/product/action frame for the cover
+4. EXACT SOURCE TIMESTAMPS: For every segment in a remix video, sourceIndex MUST be between 0 and ${sources.length - 1}, and startTime/endTime MUST stay strictly inside that source's exact duration, with each cut >= 2.2s and total assembled duration around ${minTotal}s-${maxTotal}s.
+5. COMPLETE SPOKEN THOUGHTS: When a segment contains dialogue, start and end on natural phrase boundaries so sentences NEVER cut mid-word.
+6. SAME-LANGUAGE METADATA: Write hookHeadline, title, thumbnailText, and description in ${analysis.detectedLanguage}.
+
+Source Footage & Transcripts:
+${sourceDetailsText}`,
+    });
+
+    const resp = await withModelFallback(
+      ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'],
+      (model) =>
+        ai.models.generateContent({
+          model,
+          contents: { parts },
+          config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH },
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                remixVideos: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      title: { type: Type.STRING },
+                      hookHeadline: { type: Type.STRING },
+                      description: { type: Type.STRING },
+                      secondaryCategoryName: { type: Type.STRING },
+                      selectionExplanation: { type: Type.STRING },
+                      keywords: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      editingProfile: { type: Type.STRING },
+                      cropMode: { type: Type.STRING },
+                      subtitleStyle: { type: Type.STRING },
+                      highlightColor: { type: Type.STRING },
+                      dynamicZoom: { type: Type.BOOLEAN },
+                      bgmVibe: { type: Type.STRING },
+                      transitionStyle: { type: Type.STRING },
+                      cameraEnergy: { type: Type.STRING },
+                      sfxMode: { type: Type.STRING },
+                      hookSfx: { type: Type.STRING },
+                      thumbnailText: { type: Type.STRING },
+                      thumbnailEmojis: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      thumbnailStyle: { type: Type.STRING },
+                      thumbnailSegmentIndex: { type: Type.INTEGER },
+                      segments: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            sourceIndex: { type: Type.INTEGER },
+                            startTime: { type: Type.NUMBER },
+                            endTime: { type: Type.NUMBER },
+                            role: { type: Type.STRING },
+                            visualNote: { type: Type.STRING },
+                            sfxCue: { type: Type.STRING },
+                          },
+                          required: ['sourceIndex', 'startTime', 'endTime', 'role'],
+                        },
+                      },
+                      scores: {
+                        type: Type.OBJECT,
+                        properties: {
+                          hookStrength: { type: Type.NUMBER },
+                          standaloneContext: { type: Type.NUMBER },
+                          audienceInterest: { type: Type.NUMBER },
+                          emotionalOrInfoValue: { type: Type.NUMBER },
+                          contentCompleteness: { type: Type.NUMBER },
+                          audioVisualQuality: { type: Type.NUMBER },
+                        },
+                        required: [
+                          'hookStrength',
+                          'standaloneContext',
+                          'audienceInterest',
+                          'emotionalOrInfoValue',
+                          'contentCompleteness',
+                          'audioVisualQuality',
+                        ],
+                      },
+                    },
+                    required: [
+                      'title',
+                      'hookHeadline',
+                      'description',
+                      'selectionExplanation',
+                      'keywords',
+                      'editingProfile',
+                      'cropMode',
+                      'subtitleStyle',
+                      'highlightColor',
+                      'dynamicZoom',
+                      'thumbnailText',
+                      'thumbnailEmojis',
+                      'thumbnailStyle',
+                      'segments',
+                      'scores',
+                    ],
+                  },
+                },
+              },
+              required: ['remixVideos'],
+            },
+          },
+        }),
+      'multi-video-remix-director'
+    );
+
+    const parsed = JSON.parse((resp.text ?? '{}').trim()) as {
+      remixVideos?: Array<{
+        title: string;
+        hookHeadline?: string;
+        description: string;
+        secondaryCategoryName?: string;
+        selectionExplanation: string;
+        keywords?: string[];
+        editingProfile?: string;
+        cropMode?: string;
+        subtitleStyle?: string;
+        highlightColor?: string;
+        dynamicZoom?: boolean;
+        bgmVibe?: string;
+        transitionStyle?: string;
+        cameraEnergy?: string;
+        sfxMode?: string;
+        hookSfx?: string;
+        thumbnailText?: string;
+        thumbnailEmojis?: string[];
+        thumbnailStyle?: string;
+        thumbnailSegmentIndex?: number;
+        segments?: Array<{
+          sourceIndex: number;
+          startTime: number;
+          endTime: number;
+          role: string;
+          visualNote?: string;
+          sfxCue?: string;
+        }>;
+        scores: Omit<HighlightScoreBreakdown, 'totalScore'>;
+      }>;
+    };
+
+    const VALID_ROLES = new Set(['hook', 'story', 'product', 'payoff', 'cutaway']);
+    const VALID_BGM_VIBES = new Set<BgmVibe>(['auto', 'none', 'upbeat-pop', 'lofi-warm', 'hype-beat', 'cinematic-warm']);
+    const VALID_TRANSITIONS = new Set<TransitionStyle>(['auto', 'whip-slide', 'zoom-punch', 'dissolve', 'flash-cut', 'hard-cut']);
+    const VALID_ENERGIES = new Set<CameraEnergy>(['auto', 'calm', 'dynamic', 'viral-shake']);
+    const VALID_SFX_MODES = new Set<SfxMode>(['auto', 'none', 'playful-viral', 'dramatic-impact', 'smart-ui', 'subtle-clean']);
+    const VALID_SFX_CUES = new Set<SfxCueType | 'none'>([
+      'mouse-click',
+      'clever-ding',
+      'shock-boom',
+      'buzz-zap',
+      'whoosh-swish',
+      'pop-bubble',
+      'cash-sparkle',
+      'riser-hit',
+      'none',
+    ]);
+
+    const fallbackPalette = ['#FACC15', '#38BDF8', '#FB7185', '#22C55E', '#A78BFA', '#F97316'];
+    const fallbackProfiles: EditingProfileId[] = ['Dynamic', 'Comedy', 'Cinematic', 'Podcast', 'Travel'];
+    const fallbackSubs: SubtitleStylePreset[] = ['karaoke-pop', 'bold-highlight', 'clean', 'karaoke-pop'];
+    const fallbackBgms: BgmVibe[] = ['upbeat-pop', 'hype-beat', 'cinematic-warm', 'lofi-warm', 'upbeat-pop'];
+    const fallbackTransitions: TransitionStyle[] = ['whip-slide', 'zoom-punch', 'dissolve', 'flash-cut', 'whip-slide'];
+    const fallbackEnergies: CameraEnergy[] = ['viral-shake', 'dynamic', 'calm', 'dynamic', 'viral-shake'];
+    const fallbackSfxModes: SfxMode[] = ['playful-viral', 'dramatic-impact', 'smart-ui', 'subtle-clean', 'playful-viral'];
+    const fallbackHookSfx: Array<SfxCueType> = ['shock-boom', 'clever-ding', 'pop-bubble', 'mouse-click', 'cash-sparkle'];
+
+    const results: HighlightRecord[] = [];
+    const rawRemixes = Array.isArray(parsed.remixVideos) ? parsed.remixVideos : [];
+
+    for (let rIdx = 0; rIdx < rawRemixes.length; rIdx++) {
+      const item = rawRemixes[rIdx];
+      const rawSegs = Array.isArray(item.segments) ? item.segments : [];
+      const cleanSegs: RemixSegment[] = [];
+
+      for (const seg of rawSegs) {
+        const srcIdx = Math.max(0, Math.min(sources.length - 1, Math.round(Number(seg.sourceIndex) || 0)));
+        const src = sources[srcIdx];
+        const srcDur = Math.max(4, src.metadata?.duration ?? 30);
+        let sStart = Math.max(0, Math.min(srcDur - 2, Number(seg.startTime) || 0));
+        let sEnd = Math.min(srcDur, Math.max(sStart + 2, Number(seg.endTime) || sStart + 5));
+
+        // Step A: Protect spoken words using transcript lines so no sentence gets sliced mid-word
+        const srcTranscript = src.transcript ?? [];
+        if (srcTranscript.length > 0) {
+          const overlappingStart = srcTranscript.find((t) => sStart > t.start && sStart < t.end);
+          if (overlappingStart && sStart - overlappingStart.start <= 2.4) {
+            sStart = Math.max(0, overlappingStart.start - 0.16);
+          } else {
+            const nearStart = srcTranscript.find((t) => Math.abs(t.start - sStart) <= 0.75);
+            if (nearStart) sStart = Math.max(0, nearStart.start - 0.16);
+          }
+
+          const overlappingEnd = [...srcTranscript].reverse().find((t) => sEnd > t.start && sEnd < t.end);
+          if (overlappingEnd && overlappingEnd.end - sEnd <= 2.8) {
+            sEnd = Math.min(srcDur, overlappingEnd.end + 0.30);
+          } else {
+            const nearEnd = [...srcTranscript].reverse().find((t) => Math.abs(t.end - sEnd) <= 0.85);
+            if (nearEnd && nearEnd.end > sStart + 1.8) sEnd = Math.min(srcDur, nearEnd.end + 0.30);
+          }
+        }
+
+        // Step B: Polish against real FFmpeg acoustic speech intervals so word attack/release is never clipped
+        const speechIvs = sourceSpeechIntervals.get(srcIdx) ?? [];
+        if (speechIvs.length > 0) {
+          const hitStart = speechIvs.find((iv) => sStart > iv.start && sStart < iv.end);
+          if (hitStart && sStart - hitStart.start <= 2.0) {
+            sStart = Math.max(0, hitStart.start - 0.16);
+          }
+          const hitEnd = [...speechIvs].reverse().find((iv) => sEnd > iv.start && sEnd < iv.end);
+          if (hitEnd && hitEnd.end - sEnd <= 2.2) {
+            sEnd = Math.min(srcDur, hitEnd.end + 0.30);
+          }
+        }
+
+        if (sEnd - sStart < 1.8) continue;
+        const role = VALID_ROLES.has(String(seg.role).toLowerCase())
+          ? (String(seg.role).toLowerCase() as RemixSegment['role'])
+          : cleanSegs.length === 0
+          ? 'hook'
+          : 'story';
+
+        const rawCue = String(seg.sfxCue || '').trim() as SfxCueType | 'none';
+        let cleanCue: SfxCueType | 'none' | undefined = VALID_SFX_CUES.has(rawCue)
+          ? rawCue
+          : undefined;
+        const prevSegCue = cleanSegs.length > 0 ? cleanSegs[cleanSegs.length - 1].sfxCue : undefined;
+        if (cleanCue && cleanCue !== 'none' && cleanCue === prevSegCue) {
+          cleanCue = undefined; // Let scene-aware anti-repeat scheduler pick a fresh complementary SFX
+        }
+
+        cleanSegs.push({
+          id: `seg_${rIdx}_${cleanSegs.length + 1}`,
+          sourceIndex: srcIdx,
+          sourceFilename: src.filename,
+          startTime: Number(sStart.toFixed(2)),
+          endTime: Number(sEnd.toFixed(2)),
+          role,
+          visualNote: seg.visualNote?.trim() || undefined,
+          ...(cleanCue ? { sfxCue: cleanCue } : {}),
+        });
+      }
+
+      if (cleanSegs.length === 0) continue;
+
+      // Guarantee no raw single-source full-length repost: if model emitted only 1 segment, add a short reaction/product cut from another source
+      if (cleanSegs.length === 1 && sources.length > 1) {
+        const otherIdx = (cleanSegs[0].sourceIndex + 1) % sources.length;
+        const otherSrc = sources[otherIdx];
+        const otherDur = otherSrc.metadata?.duration ?? 15;
+        const cutStart = Number(Math.min(Math.max(0, otherDur - 5), otherDur * 0.35).toFixed(2));
+        const cutEnd = Number(Math.min(otherDur, cutStart + 4.5).toFixed(2));
+        if (cutEnd - cutStart >= 2) {
+          cleanSegs.push({
+            id: `seg_${rIdx}_extra`,
+            sourceIndex: otherIdx,
+            sourceFilename: otherSrc.filename,
+            startTime: cutStart,
+            endTime: cutEnd,
+            role: 'payoff',
+            visualNote: 'Cross-clip payoff cut',
+          });
+        }
+      }
+
+      const totalDur = Number(
+        cleanSegs.reduce((acc, s) => acc + Math.max(1, s.endTime - s.startTime), 0).toFixed(2)
+      );
+      if (totalDur < 4) continue;
+
+      const breakdown = computeWeightedScore(item.scores, category);
+      const chosenProfile: EditingProfileId = VALID_PROFILES.includes(
+        item.editingProfile as EditingProfileId
+      )
+        ? (item.editingProfile as EditingProfileId)
+        : fallbackProfiles[rIdx % fallbackProfiles.length] ?? profileSpec.id;
+      const chosenCrop: CropFocusMode = VALID_CROP_MODES.includes(item.cropMode as CropFocusMode)
+        ? (item.cropMode as CropFocusMode)
+        : EDITING_PROFILES[chosenProfile].cropMode;
+      const chosenSub: SubtitleStylePreset = VALID_SUBTITLE_STYLES.includes(
+        item.subtitleStyle as SubtitleStylePreset
+      )
+        ? (item.subtitleStyle as SubtitleStylePreset)
+        : fallbackSubs[rIdx % fallbackSubs.length];
+      const chosenColor =
+        typeof item.highlightColor === 'string' &&
+        /^#[0-9a-fA-F]{6}$/.test(item.highlightColor.trim())
+          ? item.highlightColor.trim().toUpperCase()
+          : fallbackPalette[rIdx % fallbackPalette.length];
+      const chosenZoom =
+        chosenCrop === 'fit-blur'
+          ? false
+          : typeof item.dynamicZoom === 'boolean'
+          ? item.dynamicZoom
+          : EDITING_PROFILES[chosenProfile].allowDynamicZoom;
+      const chosenBgm: BgmVibe = VALID_BGM_VIBES.has(item.bgmVibe as BgmVibe)
+        ? (item.bgmVibe as BgmVibe)
+        : fallbackBgms[rIdx % fallbackBgms.length];
+      const chosenTransition: TransitionStyle = VALID_TRANSITIONS.has(item.transitionStyle as TransitionStyle)
+        ? (item.transitionStyle as TransitionStyle)
+        : fallbackTransitions[rIdx % fallbackTransitions.length];
+      const chosenEnergy: CameraEnergy = VALID_ENERGIES.has(item.cameraEnergy as CameraEnergy)
+        ? (item.cameraEnergy as CameraEnergy)
+        : fallbackEnergies[rIdx % fallbackEnergies.length];
+      const chosenSfxMode: SfxMode = VALID_SFX_MODES.has(item.sfxMode as SfxMode)
+        ? (item.sfxMode as SfxMode)
+        : fallbackSfxModes[rIdx % fallbackSfxModes.length];
+      const rawHookSfx = String(item.hookSfx || '').trim() as SfxCueType | 'auto' | 'none';
+      const chosenHookSfx: HighlightRecord['hookSfx'] =
+        rawHookSfx === 'auto' || VALID_SFX_CUES.has(rawHookSfx)
+          ? rawHookSfx
+          : fallbackHookSfx[rIdx % fallbackHookSfx.length];
+
+      const cleanTitle = (item.title || `Viral Remix #${rIdx + 1}`).trim();
+      const cleanHook =
+        (item.hookHeadline || '').trim() || cleanTitle.split(/\s+/).slice(0, 5).join(' ');
+
+      if (typeof item.thumbnailSegmentIndex === 'number' && cleanSegs.length > 0) {
+        const tIdx = Math.max(0, Math.min(cleanSegs.length - 1, Math.round(item.thumbnailSegmentIndex)));
+        cleanSegs[tIdx] = { ...cleanSegs[tIdx], isThumbnailFrame: true };
+      }
+
+      const rawThumbStyle = String(item.thumbnailStyle || '').trim() as Exclude<ThumbnailVibeStyle, 'auto'>;
+      const chosenThumbStyle: Exclude<ThumbnailVibeStyle, 'auto'> = VALID_THUMBNAIL_STYLES.includes(rawThumbStyle)
+        ? rawThumbStyle
+        : resolveThumbnailStyle(
+            {
+              thumbnailStyle: 'auto',
+              editingProfile: chosenProfile,
+              categoryId: category.id,
+              categoryName: category.name,
+              bgmVibe: chosenBgm,
+              sfxMode: chosenSfxMode,
+              title: cleanTitle,
+              description: (item.description || '').trim(),
+            },
+            brief
+          );
+
+      const fallbackThumbCopy = deriveFallbackThumbnailCopy(
+        {
+          thumbnailText: item.thumbnailText,
+          thumbnailEmojis: splitGraphemeEmojis(item.thumbnailEmojis),
+          hookHeadline: cleanHook,
+          title: cleanTitle,
+          description: (item.description || '').trim(),
+          categoryName: category.name,
+          keywords: Array.isArray(item.keywords) ? item.keywords.slice(0, 6) : [],
+        },
+        chosenThumbStyle,
+        brief
+      );
+
+      results.push({
+        id: `hl_${crypto.randomUUID().slice(0, 8)}`,
+        projectId,
+        startTime: 0,
+        endTime: totalDur,
+        duration: totalDur,
+        title: cleanTitle,
+        hookHeadline: cleanHook,
+        description: (item.description || '').trim(),
+        categoryId: category.id,
+        categoryName: category.name,
+        secondaryCategoryName: item.secondaryCategoryName?.trim() || null,
+        selectionExplanation: (item.selectionExplanation || 'Cross-clip viral remix montage').trim(),
+        keywords: Array.isArray(item.keywords) ? item.keywords.slice(0, 6) : [],
+        criteriaBreakdown: breakdown,
+        status: breakdown.totalScore >= 75 || results.length < 3 ? 'selected' : 'candidate',
+        editingProfile: chosenProfile,
+        subtitleStyle: chosenSub,
+        highlightColor: chosenColor,
+        cropMode: chosenCrop,
+        dynamicZoom: chosenZoom,
+        normalizeAudio: EDITING_PROFILES[chosenProfile]?.normalizeAudio ?? profileSpec.normalizeAudio,
+        watermarkEnabled: settings.enableWatermarkByDefault,
+        renderedVideoUrl: null,
+        qcReport: null,
+        editSegments: cleanSegs,
+        bgmVibe: chosenBgm,
+        transitionStyle: chosenTransition,
+        cameraEnergy: chosenEnergy,
+        sfxMode: chosenSfxMode,
+        hookSfx: chosenHookSfx,
+        thumbnailText: fallbackThumbCopy.text,
+        thumbnailEmojis: fallbackThumbCopy.emojis,
+        thumbnailStyle: chosenThumbStyle,
+      });
+    }
+
+    results.sort((a, b) => b.criteriaBreakdown.totalScore - a.criteriaBreakdown.totalScore);
+    return results;
+  } finally {
+    if (fs.existsSync(tmpFramesDir)) {
+      fs.rmSync(tmpFramesDir, { recursive: true, force: true });
+    }
+  }
+}
+
 export async function generateAndScoreHighlights(params: {
   projectId: string;
   title: string;
+  brief?: string;
   metadata: VideoMetadata;
   transcript: TranscriptSegment[];
   analysis: ContentAnalysis;
   settings: StudioSettings;
   sourcePath?: string;
+  sources?: ProjectSourceVideo[];
+  scenes?: SceneKeyframe[];
 }): Promise<HighlightRecord[]> {
-  const { projectId, title, metadata, transcript, analysis, settings, sourcePath } = params;
+  const { projectId, title, brief, metadata, transcript, analysis, settings, sourcePath, sources, scenes } = params;
+
+  if (sources && sources.length > 1) {
+    const remixes = await generateMultiSourceRemixHighlights({
+      projectId,
+      title,
+      brief,
+      sources,
+      scenes: scenes ?? [],
+      analysis,
+      settings,
+    });
+    if (remixes.length > 0) {
+      return remixes;
+    }
+  }
+  const cleanBrief = brief?.trim() || '';
+  const briefBlock = cleanBrief
+    ? `\nUSER CONSIGNE / CREATIVE BRIEF (HIGH PRIORITY — follow strictly when picking moments, tone, and length):\n"""\n${cleanBrief}\n"""\n${
+        analysis.briefInterpretation
+          ? `AI Creative Plan from Brief: ${analysis.briefInterpretation}\n`
+          : ''
+      }`
+    : analysis.briefInterpretation
+    ? `\nAI Creative Plan: ${analysis.briefInterpretation}\n`
+    : '';
   const category = findCategoryByIdOrName(analysis.primaryCategoryId, settings.customCategories);
   const profileSpec =
     EDITING_PROFILES[analysis.recommendedProfile] ?? EDITING_PROFILES[category.defaultEditingProfile];
@@ -395,7 +1018,7 @@ Primary Category: ${category.name}
 Secondary Categories: ${analysis.secondaryCategories.map((c) => c.categoryName).join(', ') || 'None'}
 Key Topics: ${analysis.mainTopics.join(', ') || 'General'}
 Emotional & Narrative Arc: ${analysis.emotionalArc}
-
+${briefBlock}
 Category-Specific Selection Strategy (${category.name}):
 ${category.highlightStrategy}
 
@@ -608,6 +1231,11 @@ ${win.text}`;
     subtitleStyle: SubtitleStylePreset;
     highlightColor: string;
     dynamicZoom: boolean;
+    sfxMode: SfxMode;
+    hookSfx: HighlightRecord['hookSfx'];
+    thumbnailText?: string;
+    thumbnailEmojis?: string[];
+    thumbnailStyle?: ThumbnailVibeStyle;
   }
 
   let verifiedItems: VerifiedCandidateItem[] = [];
@@ -687,8 +1315,8 @@ Your goal: >95% highlight selection precision + tailored, high-retention 9:16 vi
 
 Video Title: "${title}" | Source Resolution: ${metadata.width}x${metadata.height} | Category: ${category.name} | Language: ${analysis.detectedLanguage}
 Category Rubric Weights: Hook=${category.criteriaWeights.hookStrength}, Context=${category.criteriaWeights.standaloneContext}, Interest=${category.criteriaWeights.audienceInterest}, Value=${category.criteriaWeights.emotionalOrInfoValue}, Completeness=${category.criteriaWeights.contentCompleteness}.
-
-For EVERY candidate index (0 to ${dedupedPass1.length - 1}), inspect BOTH its Visual Frame (if attached) AND its Transcript Context:
+${briefBlock}
+For EVERY candidate index (0 to ${dedupedPass1.length - 1}), inspect BOTH its Visual Frame (if attached), the User Consigne (if provided), AND its Transcript Context:
 1. BOUNDARIES & KEEP GATE: Verify <CLIP_START> opens with an immediate attention-grabbing hook (zero unresolved context) and <CLIP_END> delivers a complete payoff. If 1 adjacent line makes it cleaner while staying near ${effectiveMin.toFixed(0)}s-${effectiveMax.toFixed(0)}s, supply verbatim refinedStartPhrase / refinedEndPhrase. Set keep=false ONLY if genuinely weak/filler.
 2. VIRAL TITLING & HOOK BANNER:
    - refinedTitle: engaging social title (4-8 words in ${analysis.detectedLanguage}).
@@ -703,6 +1331,12 @@ For EVERY candidate index (0 to ${dedupedPass1.length - 1}), inspect BOTH its Vi
    - subtitleStyle: choose best from [${VALID_SUBTITLE_STYLES.join(', ')}] ("karaoke-pop" for high-energy/viral/comedy/gaming, "bold-highlight" for podcasts/motivation/debates, "clean" for cinematic/stories/travel, "minimal-caption" ONLY for dense text/tutorials where captions shouldn't cover visuals).
    - highlightColor: choose a high-contrast #RRGGBB hex accent that pops cleanly over that clip's frame & mood (e.g. #FACC15, #38BDF8, #F59E0B, #22C55E, #FB7185, #A78BFA).
    - dynamicZoom: true for engaging talking heads/stories/action to boost retention; false ONLY when screens/slides require crisp static readability.
+   - sfxMode: choose from ["playful-viral", "dramatic-impact", "smart-ui", "subtle-clean", "none"] matching the clip's mood & brief ("none" only if brief forbids SFX).
+   - hookSfx: pick the best opening sound effect from ["mouse-click", "clever-ding", "shock-boom", "buzz-zap", "whoosh-swish", "pop-bubble", "cash-sparkle", "riser-hit", "none"] (e.g. "shock-boom" for surprises, "clever-ding" for smart tips, "buzz-zap" for mistakes/tension, "mouse-click" for screens/UI, "cash-sparkle" for gifts/wins).
+4. COVER THUMBNAIL DESIGN (attractive vertical cover tailored to this highlight & overall video vibe):
+   - thumbnailText: 2 to 4 ultra-punchy cover words in ${analysis.detectedLanguage} that spark instant curiosity.
+   - thumbnailEmojis: array of 2 to 3 expressive emojis matching the exact scene emotion & topic.
+   - thumbnailStyle: choose best art-direction style from ["viral-pop", "lifestyle-warm", "cinematic-editorial", "comedy-sticker", "tech-neon", "podcast-quote"] matching this clip & overall video type.
 
 ${reviewBlock}`,
       });
@@ -736,6 +1370,11 @@ ${reviewBlock}`,
                         subtitleStyle: { type: Type.STRING },
                         highlightColor: { type: Type.STRING },
                         dynamicZoom: { type: Type.BOOLEAN },
+                        sfxMode: { type: Type.STRING },
+                        hookSfx: { type: Type.STRING },
+                        thumbnailText: { type: Type.STRING },
+                        thumbnailEmojis: { type: Type.ARRAY, items: { type: Type.STRING } },
+                        thumbnailStyle: { type: Type.STRING },
                         scores: {
                           type: Type.OBJECT,
                           properties: {
@@ -767,6 +1406,9 @@ ${reviewBlock}`,
                         'subtitleStyle',
                         'highlightColor',
                         'dynamicZoom',
+                        'thumbnailText',
+                        'thumbnailEmojis',
+                        'thumbnailStyle',
                         'scores',
                       ],
                     },
@@ -793,9 +1435,27 @@ ${reviewBlock}`,
           subtitleStyle?: string;
           highlightColor?: string;
           dynamicZoom?: boolean;
+          sfxMode?: string;
+          hookSfx?: string;
+          thumbnailText?: string;
+          thumbnailEmojis?: string[];
+          thumbnailStyle?: string;
           scores: Omit<HighlightScoreBreakdown, 'totalScore'>;
         }>;
       };
+
+      const VALID_CRITIC_SFX_MODES = new Set<SfxMode>(['auto', 'none', 'playful-viral', 'dramatic-impact', 'smart-ui', 'subtle-clean']);
+      const VALID_CRITIC_SFX_CUES = new Set<SfxCueType | 'none'>([
+        'mouse-click',
+        'clever-ding',
+        'shock-boom',
+        'buzz-zap',
+        'whoosh-swish',
+        'pop-bubble',
+        'cash-sparkle',
+        'riser-hit',
+        'none',
+      ]);
 
       const reviewMap = new Map(
         (criticParsed.reviews ?? []).map((r) => [r.candidateIndex, r])
@@ -818,6 +1478,8 @@ ${reviewBlock}`,
             subtitleStyle: profileSpec.subtitlePreset,
             highlightColor: profileSpec.highlightColorHex || settings.defaultHighlightColor,
             dynamicZoom: category.avoidEffects ? false : profileSpec.allowDynamicZoom,
+            sfxMode: 'auto',
+            hookSfx: 'auto',
           };
         }
 
@@ -863,6 +1525,32 @@ ${reviewBlock}`,
         const cleanHook =
           (rev.hookHeadline || '').trim() || cleanTitle.split(/\s+/).slice(0, 5).join(' ');
 
+        const chosenSfxMode: SfxMode = VALID_CRITIC_SFX_MODES.has(rev.sfxMode as SfxMode)
+          ? (rev.sfxMode as SfxMode)
+          : 'auto';
+        const rawHookSfx = String(rev.hookSfx || '').trim() as SfxCueType | 'auto' | 'none';
+        const chosenHookSfx: HighlightRecord['hookSfx'] =
+          rawHookSfx === 'auto' || VALID_CRITIC_SFX_CUES.has(rawHookSfx) ? rawHookSfx : 'auto';
+
+        const rawThumbStyle = String(rev.thumbnailStyle || '').trim() as Exclude<ThumbnailVibeStyle, 'auto'>;
+        const chosenThumbStyle: Exclude<ThumbnailVibeStyle, 'auto'> = VALID_THUMBNAIL_STYLES.includes(
+          rawThumbStyle
+        )
+          ? rawThumbStyle
+          : resolveThumbnailStyle(
+              {
+                thumbnailStyle: 'auto',
+                editingProfile: chosenProfile,
+                categoryId: category.id,
+                categoryName: category.name,
+                bgmVibe: 'auto',
+                sfxMode: chosenSfxMode,
+                title: cleanTitle,
+                description: item.cand.description.trim(),
+              },
+              brief
+            );
+
         return {
           item,
           keep: Boolean(rev.keep),
@@ -879,6 +1567,11 @@ ${reviewBlock}`,
           subtitleStyle: chosenSub,
           highlightColor: chosenColor,
           dynamicZoom: chosenZoom,
+          sfxMode: chosenSfxMode,
+          hookSfx: chosenHookSfx,
+          thumbnailText: rev.thumbnailText?.trim() || undefined,
+          thumbnailEmojis: splitGraphemeEmojis(rev.thumbnailEmojis),
+          thumbnailStyle: chosenThumbStyle,
         };
       });
     } catch {
@@ -907,6 +1600,8 @@ ${reviewBlock}`,
       subtitleStyle: profileSpec.subtitlePreset,
       highlightColor: profileSpec.highlightColorHex || settings.defaultHighlightColor,
       dynamicZoom: category.avoidEffects ? false : profileSpec.allowDynamicZoom,
+      sfxMode: 'auto',
+      hookSfx: 'auto',
     }));
   }
 
@@ -951,6 +1646,33 @@ ${reviewBlock}`,
     }
 
     const finalDuration = Number(Math.max(3, endTime - startTime).toFixed(2));
+    const resolvedThumbStyle = resolveThumbnailStyle(
+      {
+        thumbnailStyle: entry.thumbnailStyle ?? 'auto',
+        editingProfile: entry.editingProfile,
+        categoryId: category.id,
+        categoryName: category.name,
+        bgmVibe: 'auto',
+        sfxMode: entry.sfxMode,
+        title: entry.title,
+        description: entry.item.cand.description.trim(),
+      },
+      brief
+    );
+    const fallbackThumbCopy = deriveFallbackThumbnailCopy(
+      {
+        thumbnailText: entry.thumbnailText,
+        thumbnailEmojis: entry.thumbnailEmojis,
+        hookHeadline: entry.hookHeadline,
+        title: entry.title,
+        description: entry.item.cand.description.trim(),
+        categoryName: category.name,
+        keywords: Array.isArray(entry.item.cand.keywords) ? entry.item.cand.keywords.slice(0, 6) : [],
+      },
+      resolvedThumbStyle,
+      brief
+    );
+
     results.push({
       id: `hl_${crypto.randomUUID().slice(0, 8)}`,
       projectId,
@@ -976,6 +1698,11 @@ ${reviewBlock}`,
       watermarkEnabled: settings.enableWatermarkByDefault,
       renderedVideoUrl: null,
       qcReport: null,
+      sfxMode: entry.sfxMode,
+      hookSfx: entry.hookSfx,
+      thumbnailText: fallbackThumbCopy.text,
+      thumbnailEmojis: fallbackThumbCopy.emojis,
+      thumbnailStyle: resolvedThumbStyle,
     });
   }
 

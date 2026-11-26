@@ -14,6 +14,12 @@ import {
   validateRenderedClip,
 } from './src/server/agents/qualityControlAgent';
 import {
+  generateHighlightThumbnail,
+  generateProjectHighlightThumbnails,
+  splitGraphemeEmojis,
+  VALID_THUMBNAIL_STYLES,
+} from './src/server/agents/thumbnailAgent';
+import {
   SAMPLE_PRESETS,
   SUPPORTED_EXTENSIONS,
   synthesizeSampleVideo,
@@ -36,9 +42,16 @@ import {
   store,
 } from './src/server/db';
 import { formatGeminiError } from './src/server/geminiClient';
-import type { EditingProfileId, HighlightRecord, StudioSettings } from './src/types/studio';
+import type {
+  EditingProfileId,
+  HighlightRecord,
+  ProjectSourceVideo,
+  RemixSegment,
+  StudioSettings,
+  ThumbnailVibeStyle,
+} from './src/types/studio';
 
-const PORT = 3001;
+const PORT = Number(process.env.PORT) || 3000;
 
 const uploadStorage = multer.diskStorage({
   destination: (_req, _file, cb) => {
@@ -109,12 +122,18 @@ async function startServer() {
           ? req.body.title.trim()
           : path.basename(req.file.originalname, path.extname(req.file.originalname));
 
+      const rawBrief =
+        typeof req.body?.brief === 'string' && req.body.brief.trim()
+          ? req.body.brief.trim().slice(0, 8000)
+          : undefined;
+
       const sourcePath = resolveSafePath(UPLOADS_DIR, req.file.filename);
       const sourceUrl = `/api/uploads/${encodeURIComponent(req.file.filename)}`;
 
       const project = store.createProject({
         id: projectId,
         title: rawTitle,
+        brief: rawBrief,
         sourceFilename: req.file.originalname,
         sourcePath,
         sourceUrl,
@@ -137,12 +156,17 @@ async function startServer() {
     try {
       const filename = typeof req.body?.filename === 'string' ? req.body.filename.trim() : '';
       const rawTitle = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+      const rawBrief =
+        typeof req.body?.brief === 'string' && req.body.brief.trim()
+          ? req.body.brief.trim().slice(0, 8000)
+          : '';
       const fileSize = Number(req.body?.fileSize ?? 0);
       const totalChunks = Number(req.body?.totalChunks ?? 0);
       const chunkSize = Number(req.body?.chunkSize ?? 14 * 1024 * 1024);
       const fingerprint = typeof req.body?.fingerprint === 'string' ? req.body.fingerprint.trim() : '';
       const attachProjectId =
         typeof req.body?.attachProjectId === 'string' ? req.body.attachProjectId.trim() : undefined;
+      const stageOnly = Boolean(req.body?.stageOnly);
 
       const ext = path.extname(filename).toLowerCase();
       if (!SUPPORTED_EXTENSIONS.has(ext)) {
@@ -173,6 +197,7 @@ async function startServer() {
       if (fingerprint && fs.existsSync(metaPath) && fs.existsSync(partPath)) {
         try {
           const existingMeta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as {
+            title?: string;
             fileSize: number;
             chunkSize: number;
             totalChunks: number;
@@ -182,6 +207,17 @@ async function startServer() {
             existingMeta.chunkSize === chunkSize &&
             existingMeta.totalChunks === totalChunks
           ) {
+            if (rawBrief) {
+              fs.writeFileSync(
+                metaPath,
+                JSON.stringify({
+                  ...existingMeta,
+                  title: rawTitle || existingMeta.title || path.basename(filename, ext),
+                  brief: rawBrief,
+                }),
+                'utf-8'
+              );
+            }
             let uploadedChunks: number[] = [];
             if (uploadChunkSets.has(uploadId)) {
               uploadedChunks = Array.from(uploadChunkSets.get(uploadId)!);
@@ -207,11 +243,13 @@ async function startServer() {
           uploadId,
           filename: path.basename(filename),
           title: rawTitle || path.basename(filename, ext),
+          brief: rawBrief,
           ext,
           fileSize,
           totalChunks,
           chunkSize,
           attachProjectId: attachProjectId || null,
+          stageOnly,
         }),
         'utf-8'
       );
@@ -306,10 +344,12 @@ async function startServer() {
       const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as {
         filename: string;
         title: string;
+        brief?: string;
         ext: string;
         fileSize: number;
         totalChunks: number;
         attachProjectId: string | null;
+        stageOnly?: boolean;
       };
 
       const stat = fs.statSync(partPath);
@@ -329,6 +369,17 @@ async function startServer() {
         fs.unlinkSync(chunksPath);
       }
       uploadChunkSets.delete(uploadId);
+
+      if (meta.stageOnly) {
+        res.json({
+          stagedFile: {
+            filename: meta.filename,
+            storedFilename: finalFilename,
+            sourceUrl,
+          },
+        });
+        return;
+      }
 
       if (meta.attachProjectId) {
         const existing = store.getProjectInternal(meta.attachProjectId);
@@ -360,6 +411,7 @@ async function startServer() {
       const project = store.createProject({
         id: projectId,
         title: meta.title,
+        brief: meta.brief,
         sourceFilename: meta.filename,
         sourcePath: finalPath,
         sourceUrl,
@@ -373,6 +425,64 @@ async function startServer() {
     }
   });
 
+  // Create a Multi-Video Mix-and-Match Remix Project from staged uploaded files
+  app.post('/api/projects/remix', (req, res) => {
+    try {
+      const stagedFiles = Array.isArray(req.body?.stagedFiles)
+        ? (req.body.stagedFiles as Array<{ filename?: string; storedFilename?: string }>)
+        : [];
+      if (stagedFiles.length < 2) {
+        res.status(400).json({ error: 'Upload at least 2 source videos to create a multi-clip remix project.' });
+        return;
+      }
+
+      const rawTitle =
+        typeof req.body?.title === 'string' && req.body.title.trim()
+          ? req.body.title.trim()
+          : `Multi-Clip Remix (${stagedFiles.length} videos)`;
+      const rawBrief =
+        typeof req.body?.brief === 'string' && req.body.brief.trim()
+          ? req.body.brief.trim().slice(0, 8000)
+          : undefined;
+
+      const sources: ProjectSourceVideo[] = stagedFiles.map((sf, index) => {
+        const stored = path.basename(String(sf.storedFilename || ''));
+        if (!stored) {
+          throw new Error(`Missing stored filename for source video #${index + 1}.`);
+        }
+        const filePath = resolveSafePath(UPLOADS_DIR, stored);
+        if (!fs.existsSync(filePath)) {
+          throw new Error(`Uploaded file not found for source video #${index + 1}.`);
+        }
+        return {
+          id: `src_${index}_${crypto.randomUUID().slice(0, 6)}`,
+          index,
+          filename: String(sf.filename || stored),
+          sourceUrl: `/api/uploads/${encodeURIComponent(stored)}`,
+          sourcePath: filePath,
+        };
+      });
+
+      const projectId = `prj_${crypto.randomUUID().slice(0, 8)}`;
+      const primary = sources[0];
+      const project = store.createProject({
+        id: projectId,
+        title: rawTitle,
+        brief: rawBrief,
+        sourceFilename: `${sources.length} clips (${primary.filename}…)`,
+        sourcePath: primary.sourcePath!,
+        sourceUrl: primary.sourceUrl,
+        sources,
+      });
+
+      void runProjectPipeline(projectId);
+      res.status(201).json({ project });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to create multi-video remix project';
+      res.status(400).json({ error: msg });
+    }
+  });
+
   // Import a video directly from a YouTube link (with automatic Gemini URL fallback if cloud IP hits bot check)
   app.post('/api/projects/youtube', async (req, res) => {
     try {
@@ -381,6 +491,10 @@ async function startServer() {
         typeof req.body?.title === 'string' && req.body.title.trim()
           ? req.body.title.trim()
           : '';
+      const rawBrief =
+        typeof req.body?.brief === 'string' && req.body.brief.trim()
+          ? req.body.brief.trim().slice(0, 8000)
+          : undefined;
       const cookie = typeof req.body?.cookie === 'string' ? req.body.cookie : undefined;
 
       const meta = await fetchYouTubeMetadata({ rawUrl, cookie });
@@ -393,6 +507,7 @@ async function startServer() {
       const project = store.createProject({
         id: projectId,
         title: customTitle || meta.title,
+        brief: rawBrief,
         sourceFilename,
         sourcePath,
         sourceUrl,
@@ -560,6 +675,11 @@ async function startServer() {
       if (internal.sourcePath && fs.existsSync(internal.sourcePath)) {
         fs.unlinkSync(internal.sourcePath);
       }
+      for (const s of internal.sources ?? []) {
+        if (s.sourcePath && s.sourcePath !== internal.sourcePath && fs.existsSync(s.sourcePath)) {
+          fs.unlinkSync(s.sourcePath);
+        }
+      }
       const pDir = resolveSafePath(PROJECTS_DIR, internal.id);
       if (fs.existsSync(pDir)) {
         fs.rmSync(pDir, { recursive: true, force: true });
@@ -606,10 +726,15 @@ async function startServer() {
     }
 
     const settings = store.getSettings();
-    const { primaryCategoryId, recommendedProfile } = req.body as {
+    const { primaryCategoryId, recommendedProfile, brief } = req.body as {
       primaryCategoryId?: string;
       recommendedProfile?: EditingProfileId;
+      brief?: string;
     };
+
+    if (typeof brief === 'string') {
+      store.updateProjectBrief(project.id, brief);
+    }
 
     const nextCategory = primaryCategoryId
       ? findCategoryByIdOrName(primaryCategoryId, settings.customCategories)
@@ -629,10 +754,10 @@ async function startServer() {
     };
 
     store.saveAnalysis(project.id, updatedAnalysis);
-    res.json({ analysis: updatedAnalysis });
+    res.json({ analysis: updatedAnalysis, brief: store.getProject(project.id)?.brief });
   });
 
-  // Re-run Highlight Agent with updated category/settings
+  // Re-run Highlight Agent with updated category/settings/brief
   app.post('/api/projects/:id/reanalyze-highlights', async (req, res) => {
     try {
       const project = store.getProjectInternal(req.params.id);
@@ -645,15 +770,37 @@ async function startServer() {
       const highlights = await generateAndScoreHighlights({
         projectId: project.id,
         title: project.title,
+        brief: project.brief,
         metadata: project.metadata,
         transcript: project.transcript,
         analysis: project.analysis,
         settings,
         sourcePath: project.hasLocalVideoFile ? project.sourcePath : undefined,
+        sources: project.sources,
+        scenes: project.scenes,
       });
 
       store.replaceProjectHighlights(project.id, highlights);
-      res.json({ highlights });
+      await generateProjectHighlightThumbnails({
+        projectId: project.id,
+        highlights,
+        sourcePath: project.hasLocalVideoFile ? project.sourcePath : undefined,
+        sources: project.sources,
+        scenes: project.scenes,
+        projectBrief: project.brief,
+        durationFallback: project.metadata?.duration,
+        onEachComplete: (hlId, resThumb) => {
+          store.updateHighlight(hlId, {
+            thumbnailPath: resThumb.thumbnailPath,
+            thumbnailUrl: resThumb.thumbnailUrl,
+            thumbnailText: resThumb.thumbnailText,
+            thumbnailEmojis: resThumb.thumbnailEmojis,
+            thumbnailStyle: resThumb.thumbnailStyle,
+            thumbnailTimestamp: resThumb.thumbnailTimestamp,
+          });
+        },
+      });
+      res.json({ highlights: store.listHighlights(project.id) });
     } catch (err) {
       const msg = formatGeminiError(err) || 'Highlight re-analysis failed';
       res.status(500).json({ error: msg });
@@ -661,7 +808,7 @@ async function startServer() {
   });
 
   // Update highlight selection, trim boundaries, or editing controls
-  app.patch('/api/highlights/:id', (req, res) => {
+  app.patch('/api/highlights/:id', async (req, res) => {
     const existing = store.getHighlightInternal(req.params.id);
     if (!existing) {
       res.status(404).json({ error: 'Highlight not found' });
@@ -711,10 +858,75 @@ async function startServer() {
     if (typeof body.dynamicZoom === 'boolean') patch.dynamicZoom = body.dynamicZoom;
     if (typeof body.normalizeAudio === 'boolean') patch.normalizeAudio = body.normalizeAudio;
     if (typeof body.watermarkEnabled === 'boolean') patch.watermarkEnabled = body.watermarkEnabled;
+    if (body.bgmVibe && ['auto', 'none', 'upbeat-pop', 'lofi-warm', 'hype-beat', 'cinematic-warm'].includes(body.bgmVibe)) {
+      patch.bgmVibe = body.bgmVibe;
+    }
+    if (body.transitionStyle && ['auto', 'whip-slide', 'zoom-punch', 'dissolve', 'flash-cut', 'hard-cut'].includes(body.transitionStyle)) {
+      patch.transitionStyle = body.transitionStyle;
+    }
+    if (body.cameraEnergy && ['auto', 'calm', 'dynamic', 'viral-shake'].includes(body.cameraEnergy)) {
+      patch.cameraEnergy = body.cameraEnergy;
+    }
+    if (body.sfxMode && ['auto', 'none', 'playful-viral', 'dramatic-impact', 'smart-ui', 'subtle-clean'].includes(body.sfxMode)) {
+      patch.sfxMode = body.sfxMode;
+    }
+    if (
+      body.hookSfx &&
+      [
+        'auto',
+        'none',
+        'mouse-click',
+        'clever-ding',
+        'shock-boom',
+        'buzz-zap',
+        'whoosh-swish',
+        'pop-bubble',
+        'cash-sparkle',
+        'riser-hit',
+      ].includes(body.hookSfx)
+    ) {
+      patch.hookSfx = body.hookSfx;
+    }
+    if (Array.isArray(body.editSegments) && body.editSegments.length > 0) {
+      const cleanedSegs = (body.editSegments as RemixSegment[]).filter(
+        (s) =>
+          typeof s.sourceIndex === 'number' &&
+          typeof s.startTime === 'number' &&
+          typeof s.endTime === 'number' &&
+          s.endTime > s.startTime
+      );
+      if (cleanedSegs.length > 0) {
+        patch.editSegments = cleanedSegs;
+        const totalDur = Number(
+          cleanedSegs.reduce((acc, s) => acc + (s.endTime - s.startTime), 0).toFixed(2)
+        );
+        patch.startTime = 0;
+        patch.endTime = totalDur;
+        patch.duration = totalDur;
+      }
+    }
+
+    if (typeof body.thumbnailText === 'string') {
+      patch.thumbnailText = body.thumbnailText.trim();
+    }
+    if (body.thumbnailEmojis !== undefined) {
+      patch.thumbnailEmojis = splitGraphemeEmojis(body.thumbnailEmojis);
+    }
+    if (
+      body.thumbnailStyle &&
+      (body.thumbnailStyle === 'auto' ||
+        VALID_THUMBNAIL_STYLES.includes(body.thumbnailStyle as Exclude<ThumbnailVibeStyle, 'auto'>))
+    ) {
+      patch.thumbnailStyle = body.thumbnailStyle;
+    }
+    if (typeof body.thumbnailTimestamp === 'number' && body.thumbnailTimestamp >= 0) {
+      patch.thumbnailTimestamp = Number(body.thumbnailTimestamp.toFixed(2));
+    }
 
     const affectsRender =
       (patch.startTime !== undefined && patch.startTime !== existing.startTime) ||
       (patch.endTime !== undefined && patch.endTime !== existing.endTime) ||
+      patch.editSegments !== undefined ||
       (patch.hookHeadline !== undefined && patch.hookHeadline !== (existing.hookHeadline ?? '')) ||
       (patch.editingProfile !== undefined && patch.editingProfile !== existing.editingProfile) ||
       (patch.subtitleStyle !== undefined && patch.subtitleStyle !== existing.subtitleStyle) ||
@@ -722,7 +934,21 @@ async function startServer() {
       (patch.cropMode !== undefined && patch.cropMode !== existing.cropMode) ||
       (patch.dynamicZoom !== undefined && patch.dynamicZoom !== existing.dynamicZoom) ||
       (patch.normalizeAudio !== undefined && patch.normalizeAudio !== existing.normalizeAudio) ||
-      (patch.watermarkEnabled !== undefined && patch.watermarkEnabled !== existing.watermarkEnabled);
+      (patch.watermarkEnabled !== undefined && patch.watermarkEnabled !== existing.watermarkEnabled) ||
+      (patch.bgmVibe !== undefined && patch.bgmVibe !== (existing.bgmVibe ?? 'auto')) ||
+      (patch.transitionStyle !== undefined && patch.transitionStyle !== (existing.transitionStyle ?? 'auto')) ||
+      (patch.cameraEnergy !== undefined && patch.cameraEnergy !== (existing.cameraEnergy ?? 'auto')) ||
+      (patch.sfxMode !== undefined && patch.sfxMode !== (existing.sfxMode ?? 'auto')) ||
+      (patch.hookSfx !== undefined && patch.hookSfx !== (existing.hookSfx ?? 'auto'));
+
+    const affectsThumbnail =
+      (patch.thumbnailText !== undefined && patch.thumbnailText !== (existing.thumbnailText ?? '')) ||
+      patch.thumbnailEmojis !== undefined ||
+      (patch.thumbnailStyle !== undefined && patch.thumbnailStyle !== (existing.thumbnailStyle ?? 'auto')) ||
+      (patch.thumbnailTimestamp !== undefined && patch.thumbnailTimestamp !== existing.thumbnailTimestamp) ||
+      (patch.cropMode !== undefined && patch.cropMode !== existing.cropMode) ||
+      (patch.highlightColor !== undefined && patch.highlightColor !== existing.highlightColor) ||
+      (patch.editingProfile !== undefined && patch.editingProfile !== existing.editingProfile);
 
     if (affectsRender) {
       patch.renderedVideoPath = null;
@@ -730,8 +956,100 @@ async function startServer() {
       patch.qcReport = null;
     }
 
-    const updated = store.updateHighlight(existing.id, patch);
+    let updated = store.updateHighlight(existing.id, patch);
+
+    if (updated && affectsThumbnail) {
+      const project = store.getProjectInternal(existing.projectId);
+      if (project) {
+        try {
+          const thumbRes = await generateHighlightThumbnail({
+            projectId: project.id,
+            highlight: updated,
+            sourcePath: project.hasLocalVideoFile ? project.sourcePath : null,
+            sources: project.sources,
+            scenes: project.scenes,
+            projectBrief: project.brief,
+            durationFallback: project.metadata?.duration,
+          });
+          updated = store.updateHighlight(updated.id, {
+            thumbnailPath: thumbRes.thumbnailPath,
+            thumbnailUrl: thumbRes.thumbnailUrl,
+            thumbnailText: thumbRes.thumbnailText,
+            thumbnailEmojis: thumbRes.thumbnailEmojis,
+            thumbnailStyle: thumbRes.thumbnailStyle,
+            thumbnailTimestamp: thumbRes.thumbnailTimestamp,
+          });
+        } catch (err) {
+          console.warn('[PATCH /api/highlights] Thumbnail update failed:', err);
+        }
+      }
+    }
+
     res.json({ highlight: updated });
+  });
+
+  // Regenerate a highlight's 9:16 stylized cover thumbnail on demand
+  app.post('/api/highlights/:id/regenerate-thumbnail', async (req, res) => {
+    try {
+      const hl = store.getHighlightInternal(req.params.id);
+      if (!hl) {
+        res.status(404).json({ error: 'Highlight not found' });
+        return;
+      }
+      const project = store.getProjectInternal(hl.projectId);
+      if (!project) {
+        res.status(404).json({ error: 'Parent project not found' });
+        return;
+      }
+
+      const body = (req.body || {}) as Partial<HighlightRecord>;
+      const candidatePatch: Parameters<typeof store.updateHighlight>[1] = {};
+      if (typeof body.thumbnailText === 'string') {
+        candidatePatch.thumbnailText = body.thumbnailText.trim();
+      }
+      if (body.thumbnailEmojis !== undefined) {
+        candidatePatch.thumbnailEmojis = splitGraphemeEmojis(body.thumbnailEmojis);
+      }
+      if (
+        body.thumbnailStyle &&
+        (body.thumbnailStyle === 'auto' ||
+          VALID_THUMBNAIL_STYLES.includes(body.thumbnailStyle as Exclude<ThumbnailVibeStyle, 'auto'>))
+      ) {
+        candidatePatch.thumbnailStyle = body.thumbnailStyle;
+      }
+      if (typeof body.thumbnailTimestamp === 'number' && body.thumbnailTimestamp >= 0) {
+        candidatePatch.thumbnailTimestamp = Number(body.thumbnailTimestamp.toFixed(2));
+      }
+
+      const preUpdated =
+        Object.keys(candidatePatch).length > 0
+          ? store.updateHighlight(hl.id, candidatePatch) ?? hl
+          : hl;
+
+      const thumbRes = await generateHighlightThumbnail({
+        projectId: project.id,
+        highlight: preUpdated,
+        sourcePath: project.hasLocalVideoFile ? project.sourcePath : null,
+        sources: project.sources,
+        scenes: project.scenes,
+        projectBrief: project.brief,
+        durationFallback: project.metadata?.duration,
+      });
+
+      const updated = store.updateHighlight(hl.id, {
+        thumbnailPath: thumbRes.thumbnailPath,
+        thumbnailUrl: thumbRes.thumbnailUrl,
+        thumbnailText: thumbRes.thumbnailText,
+        thumbnailEmojis: thumbRes.thumbnailEmojis,
+        thumbnailStyle: thumbRes.thumbnailStyle,
+        thumbnailTimestamp: thumbRes.thumbnailTimestamp,
+      });
+
+      res.json({ highlight: updated });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to generate highlight thumbnail';
+      res.status(500).json({ error: msg });
+    }
   });
 
   // Deduplicate concurrent FFmpeg renders per highlightId so duplicate clicks/exports never corrupt output
@@ -769,12 +1087,14 @@ async function startServer() {
       const settings = store.getSettings();
       const rendered = await renderAdaptiveClip({
         projectId: project.id,
+        projectBrief: project.brief,
         sourcePath: project.sourcePath,
         metadata: project.metadata,
         highlight: hl,
         transcript: project.transcript,
         settings,
         languageCode: project.analysis?.languageCode || 'en',
+        sources: project.sources,
       });
 
       const qcReport = await validateRenderedClip({
@@ -783,6 +1103,7 @@ async function startServer() {
         transcript: project.transcript,
         sourceMetadata: project.metadata,
         settings,
+        sources: project.sources,
       });
 
       const updated = store.updateHighlight(hl.id, {
@@ -822,6 +1143,65 @@ async function startServer() {
       const project = store.getProjectInternal(hl.projectId);
       if (!project) {
         res.status(404).json({ error: 'Parent project not found' });
+        return;
+      }
+
+      if (hl.editSegments && hl.editSegments.length > 0 && project.sources) {
+        const ts = hl.transitionStyle && hl.transitionStyle !== 'auto'
+          ? hl.transitionStyle
+          : hl.editingProfile === 'Dynamic' || hl.editingProfile === 'Gaming'
+          ? 'zoom-punch'
+          : hl.editingProfile === 'Comedy' || hl.editingProfile === 'Travel'
+          ? 'whip-slide'
+          : hl.editingProfile === 'Cinematic'
+          ? 'dissolve'
+          : 'hard-cut';
+        const segHash = crypto
+          .createHash('sha1')
+          .update(
+            `${ts}|` +
+              hl.editSegments.map((s) => `${s.sourceIndex}:${s.startTime.toFixed(2)}-${s.endTime.toFixed(2)}`).join('|')
+          )
+          .digest('hex')
+          .slice(0, 10);
+        const cacheFile = resolveSafePath(
+          PROJECTS_DIR,
+          project.id,
+          'renders',
+          `subalign_${hl.id}_remix_${segHash}.json`
+        );
+        if (fs.existsSync(cacheFile)) {
+          try {
+            const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
+            if (Array.isArray(cached) && cached.length > 0) {
+              res.json({ cues: cached });
+              return;
+            }
+          } catch {
+            // Fall through to live segment computation
+          }
+        }
+
+        const cues: Array<{ start: number; end: number; speaker: string; text: string }> = [];
+        let cursor = 0;
+        for (const seg of hl.editSegments) {
+          const segDur = Math.max(0.5, seg.endTime - seg.startTime);
+          const srcLines = project.sources[seg.sourceIndex]?.transcript ?? [];
+          for (const s of srcLines) {
+            if (s.end <= seg.startTime || s.start >= seg.endTime) continue;
+            const localStart = Math.max(0, s.start - seg.startTime);
+            const localEnd = Math.min(segDur, s.end - seg.startTime);
+            if (localEnd - localStart < 0.15) continue;
+            cues.push({
+              start: Number((cursor + localStart).toFixed(2)),
+              end: Number((cursor + localEnd).toFixed(2)),
+              speaker: s.speaker,
+              text: s.text,
+            });
+          }
+          cursor += segDur;
+        }
+        res.json({ cues });
         return;
       }
 
@@ -899,12 +1279,14 @@ async function startServer() {
       const settings = store.getSettings();
       const healJob = autoHealAndRegenerateClip({
         projectId: project.id,
+        projectBrief: project.brief,
         sourcePath: project.sourcePath,
         sourceMetadata: project.metadata,
         highlight: hl,
         transcript: project.transcript,
         settings,
         languageCode: project.analysis?.languageCode || 'en',
+        sources: project.sources,
       }).then((healed) => {
         const updated = store.updateHighlight(hl.id, {
           ...healed.patchedHighlight,
@@ -975,6 +1357,8 @@ async function startServer() {
         project,
         highlight: hl,
         renderedVideoPath: renderedPath!,
+        sourcePath: project.sourcePath,
+        sources: project.sources,
       });
 
       const savedExport = store.createExport(exportData);
@@ -1033,6 +1417,8 @@ async function startServer() {
           project,
           highlight: hl,
           renderedVideoPath: renderedPath!,
+          sourcePath: project.sourcePath,
+          sources: project.sources,
         });
         createdExports.push(store.createExport(exportData));
         store.updateHighlight(hl.id, { status: 'exported' });
@@ -1100,6 +1486,28 @@ async function startServer() {
       );
       if (!fs.existsSync(filePath)) {
         res.status(404).end();
+        return;
+      }
+      res.sendFile(filePath);
+    } catch {
+      res.status(403).end();
+    }
+  });
+
+  app.get('/api/projects/:id/thumbnails/:filename', (req, res) => {
+    try {
+      const filePath = resolveSafePath(
+        PROJECTS_DIR,
+        path.basename(req.params.id),
+        'thumbnails',
+        path.basename(req.params.filename)
+      );
+      if (!fs.existsSync(filePath)) {
+        res.status(404).end();
+        return;
+      }
+      if (req.query.download === '1') {
+        res.download(filePath);
         return;
       }
       res.sendFile(filePath);
